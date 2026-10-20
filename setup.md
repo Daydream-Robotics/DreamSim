@@ -43,6 +43,14 @@ uv run python -c "from isaacsim import SimulationApp; app = SimulationApp({'head
 ### **Native build (robot-core MPC)**
 Needs the MSVC compiler from [VS Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) ("Desktop development with C++"). CMake and Ninja come from the uv dev group, so run from a "Developer PowerShell for VS 2022":
 ```bash
-uv run cmake -S native/robotcore_mpc/third_party/robotcore/jetson-nano -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-uv run cmake --build build --target robotcore_mpc
+uv run cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+uv run cmake --build build
 ```
+This builds robot-core's `robotcore_mpc` library and `build/als_dump.exe`, and writes `build/compile_commands.json` for IntelliSense.
+
+### **Draw an ALS path on the field**
+Builds robot-core ALS paths from a JerryIO file (default: robot-core's `auton` test path) and draws them as lines coloured by speed (purple = slow, yellow = fast):
+```bash
+uv run python scripts/draw_als_path.py --stage <field>.usd --path <file>.path.jerryio.txt
+```
+If the paths sit rotated relative to the field, pass `--yaw-deg 90` (or 180/-90).
