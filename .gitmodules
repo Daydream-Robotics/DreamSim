@@ -1,0 +1,5 @@
+[submodule "native/robotcore_mpc/third_party/robotcore"]
+	path = native/robotcore_mpc/third_party/robotcore
+	url = https://github.com/Daydream-Robotics/robot-core.git
+	branch = dev/integration
+	shallow = true

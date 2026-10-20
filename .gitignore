@@ -428,3 +428,9 @@ FodyWeavers.xsd
 *.msm
 *.msp
 IsaacLab/
+
+# uv environment
+.venv/
+
+# CMake build output
+build/
