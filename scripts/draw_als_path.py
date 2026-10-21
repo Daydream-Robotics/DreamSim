@@ -1,7 +1,7 @@
 """Draw robot-core ALS paths on the field as speed-coloured USD curves.
 
 Runs build/als_dump (the real robot-core ALS_Path) on a JerryIO file and writes each path as a
-linear UsdGeom.BasisCurves under /World/ALSPaths, coloured by path speed v (viridis, slow -> fast).
+flat ribbon UsdGeom.Mesh under /World/ALSPaths, coloured by path speed v (viridis, slow -> fast).
 Field frame: JerryIO GPS coords, field-center origin, +X/+Y as in JerryIO.
 
 usage:
@@ -29,7 +29,7 @@ parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.R
 parser.add_argument("--path", type=Path, default=DEFAULT_PATH, help="JerryIO path file")
 parser.add_argument("--stage", type=Path, default=None, help="USD stage to draw on (default: empty stage)")
 parser.add_argument("--height", type=float, default=0.02, help="line height above z=0 (m)")
-parser.add_argument("--width", type=float, default=0.015, help="line width (m)")
+parser.add_argument("--width", type=float, default=0.02, help="line width (m)")
 parser.add_argument("--yaw-deg", type=float, default=0.0, help="rotate paths about Z to line up with the field USD")
 parser.add_argument("--spacing", type=float, default=0.25, help="ALS sample spacing (in)")
 parser.add_argument("--headless", action="store_true")
@@ -86,16 +86,33 @@ if stage.GetPrimAtPath(root):
     stage.RemovePrim(root)
 UsdGeom.Xform.Define(stage, root)
 
+z = args.height / UsdGeom.GetStageMetersPerUnit(stage)
+half_w = args.width / 2 / UsdGeom.GetStageMetersPerUnit(stage)
+
+# flat ribbon mesh instead of BasisCurves: RTX's curve shaders take minutes to compile on
+# first use and stall the app, plain meshes use the already-compiled pipeline
 for i, samples in enumerate(paths):
-    curve = UsdGeom.BasisCurves.Define(stage, root.AppendChild(f"path_{i}"))
-    curve.CreateTypeAttr(UsdGeom.Tokens.linear)
-    pts = [Gf.Vec3f((x * c - y * s) * to_stage, (x * s + y * c) * to_stage, args.height / UsdGeom.GetStageMetersPerUnit(stage)) for x, y, _ in samples]
-    curve.CreatePointsAttr(Vt.Vec3fArray(pts))
-    curve.CreateCurveVertexCountsAttr(Vt.IntArray([len(pts)]))
-    curve.CreateWidthsAttr(Vt.FloatArray([args.width / UsdGeom.GetStageMetersPerUnit(stage)]))
-    curve.SetWidthsInterpolation(UsdGeom.Tokens.constant)
-    color = curve.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex)
-    color.Set(Vt.Vec3fArray([Gf.Vec3f(*viridis((v - v_min) / v_span)) for _, _, v in samples]))
+    xy = [((x * c - y * s) * to_stage, (x * s + y * c) * to_stage) for x, y, _ in samples]
+    pts, colors = [], []
+    for j, (px, py) in enumerate(xy):
+        # tangent from neighbours, ribbon edges offset along its left normal
+        ax, ay = xy[max(j - 1, 0)]
+        bx, by = xy[min(j + 1, len(xy) - 1)]
+        tx, ty = bx - ax, by - ay
+        norm = math.hypot(tx, ty) or 1.0
+        nx, ny = -ty / norm * half_w, tx / norm * half_w
+        pts += [Gf.Vec3f(px + nx, py + ny, z), Gf.Vec3f(px - nx, py - ny, z)]
+        col = Gf.Vec3f(*viridis((samples[j][2] - v_min) / v_span))
+        colors += [col, col]
+
+    mesh = UsdGeom.Mesh.Define(stage, root.AppendChild(f"path_{i}"))
+    mesh.CreatePointsAttr(Vt.Vec3fArray(pts))
+    # quad j: right_j, right_j+1, left_j+1, left_j (counter-clockwise seen from +Z)
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray([4] * (len(xy) - 1)))
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([k for j in range(len(xy) - 1) for k in (2 * j + 1, 2 * j + 3, 2 * j + 2, 2 * j)]))
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+    mesh.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex).Set(Vt.Vec3fArray(colors))
 
 print(f"[ALS] drew {len(paths)} paths ({sum(map(len, paths))} samples) from {args.path.name}")
 print(f"[ALS] colour: v={v_min:.1f} (purple) -> v={v_max:.1f} (yellow), in the path file's speed units")

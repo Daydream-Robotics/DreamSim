@@ -41,12 +41,12 @@ uv run python -c "from isaacsim import SimulationApp; app = SimulationApp({'head
 ```
 
 ### **Native build (robot-core MPC)**
-Needs the MSVC compiler from [VS Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) ("Desktop development with C++"). CMake and Ninja come from the uv dev group, so run from a "Developer PowerShell for VS 2022":
+Needs the MSVC compiler from [VS Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/) ("Desktop development with C++"). CMake and Ninja come from the uv dev group. From any terminal:
 ```bash
-uv run cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-uv run cmake --build build
+scripts\build_native.bat          # incremental build
+scripts\build_native.bat clean    # wipe build/ and rebuild from scratch
 ```
-This builds robot-core's `robotcore_mpc` library and `build/als_dump.exe`, and writes `build/compile_commands.json` for IntelliSense.
+The script loads the 64-bit MSVC environment itself, then builds robot-core's `robotcore_mpc` library (plus OSQP) and `build/als_dump.exe`, and writes `build/compile_commands.json` for IntelliSense.
 
 ### **Draw an ALS path on the field**
 Builds robot-core ALS paths from a JerryIO file (default: robot-core's `auton` test path) and draws them as lines coloured by speed (purple = slow, yellow = fast):
