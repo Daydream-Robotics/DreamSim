@@ -1,7 +1,7 @@
 """Draw robot-core ALS paths on the field as speed-coloured USD curves.
 
 Runs build/als_dump (the real robot-core ALS_Path) on a JerryIO file and writes each path as a
-flat ribbon UsdGeom.Mesh under /World/ALSPaths, coloured by path speed v (viridis, slow -> fast).
+flat ribbon UsdGeom.Mesh under /World/ALSPaths, coloured by path speed v (red slow -> green fast).
 Field frame: JerryIO GPS coords, field-center origin, +X/+Y as in JerryIO.
 
 usage:
@@ -22,8 +22,8 @@ DEFAULT_PATH = ROOT / "native/robotcore_mpc/third_party/robotcore/common-utils/p
 ALS_DUMP = ROOT / "build" / ("als_dump.exe" if sys.platform == "win32" else "als_dump")
 INCH = 0.0254
 
-# viridis stops, sampled at 0, .25, .5, .75, 1
-VIRIDIS = [(0.267, 0.005, 0.329), (0.229, 0.322, 0.546), (0.128, 0.567, 0.551), (0.369, 0.789, 0.383), (0.993, 0.906, 0.144)]
+# slow -> fast: red, yellow, green (through yellow so the middle doesn't go brown)
+SPEED_COLORS = [(0.9, 0.0, 0.0), (1.0, 0.85, 0.0), (0.0, 0.8, 0.0)]
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--path", type=Path, default=DEFAULT_PATH, help="JerryIO path file")
@@ -49,11 +49,11 @@ def load_samples():
     return [paths[k] for k in sorted(paths)]
 
 
-def viridis(t):
-    t = min(max(t, 0.0), 1.0) * (len(VIRIDIS) - 1)
-    i = min(int(t), len(VIRIDIS) - 2)
+def speed_color(t):
+    t = min(max(t, 0.0), 1.0) * (len(SPEED_COLORS) - 1)
+    i = min(int(t), len(SPEED_COLORS) - 2)
     f = t - i
-    return tuple(a + (b - a) * f for a, b in zip(VIRIDIS[i], VIRIDIS[i + 1]))
+    return tuple(a + (b - a) * f for a, b in zip(SPEED_COLORS[i], SPEED_COLORS[i + 1]))
 
 
 paths = load_samples()
@@ -64,7 +64,7 @@ from isaacsim import SimulationApp
 app = SimulationApp({"headless": args.headless})
 
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom, Vt
+from pxr import Gf, Sdf, UsdGeom, UsdShade, Vt
 
 ctx = omni.usd.get_context()
 if args.stage:
@@ -86,6 +86,20 @@ if stage.GetPrimAtPath(root):
     stage.RemovePrim(root)
 UsdGeom.Xform.Define(stage, root)
 
+# displayColor alone renders black in RTX (and the stage may have no lights), so bind an
+# emissive preview material that reads the per-vertex displayColor
+material = UsdShade.Material.Define(stage, root.AppendChild("SpeedColor"))
+reader = UsdShade.Shader.Define(stage, material.GetPath().AppendChild("displayColor"))
+reader.CreateIdAttr("UsdPrimvarReader_float3")
+reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("displayColor")
+reader_out = reader.CreateOutput("result", Sdf.ValueTypeNames.Float3)
+surface = UsdShade.Shader.Define(stage, material.GetPath().AppendChild("surface"))
+surface.CreateIdAttr("UsdPreviewSurface")
+surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(reader_out)
+surface.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(reader_out)
+surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(1.0)
+material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
+
 z = args.height / UsdGeom.GetStageMetersPerUnit(stage)
 half_w = args.width / 2 / UsdGeom.GetStageMetersPerUnit(stage)
 
@@ -102,7 +116,7 @@ for i, samples in enumerate(paths):
         norm = math.hypot(tx, ty) or 1.0
         nx, ny = -ty / norm * half_w, tx / norm * half_w
         pts += [Gf.Vec3f(px + nx, py + ny, z), Gf.Vec3f(px - nx, py - ny, z)]
-        col = Gf.Vec3f(*viridis((samples[j][2] - v_min) / v_span))
+        col = Gf.Vec3f(*speed_color((samples[j][2] - v_min) / v_span))
         colors += [col, col]
 
     mesh = UsdGeom.Mesh.Define(stage, root.AppendChild(f"path_{i}"))
@@ -113,9 +127,10 @@ for i, samples in enumerate(paths):
     mesh.CreateDoubleSidedAttr(True)
     mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
     mesh.CreateDisplayColorPrimvar(UsdGeom.Tokens.vertex).Set(Vt.Vec3fArray(colors))
+    UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
 
 print(f"[ALS] drew {len(paths)} paths ({sum(map(len, paths))} samples) from {args.path.name}")
-print(f"[ALS] colour: v={v_min:.1f} (purple) -> v={v_max:.1f} (yellow), in the path file's speed units")
+print(f"[ALS] colour: v={v_min:.1f} (red) -> v={v_max:.1f} (green), in the path file's speed units")
 
 if args.save:
     stage.Export(str(args.save.resolve()))
