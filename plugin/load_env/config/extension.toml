@@ -1,0 +1,14 @@
+[package]
+title = "Environment Loader"
+description = "button to load field environment."
+authors = ["Hakim"]
+version = "1.0.0"
+category = "Simulation"
+keywords = ["dreamsim", "v5", "field"]
+is_extension = true
+
+[dependencies]
+"omni.kit.window.extension" = {}
+
+[[python.module]]
+name = "load_env" 
