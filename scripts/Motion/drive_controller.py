@@ -17,7 +17,7 @@ import omni.appwindow
 import omni.kit.app
 import omni.timeline
 import omni.usd
-from pxr import Gf, PhysxSchema, UsdPhysics
+from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
 
 
 # Edit these settings; they're all really bad right now.
@@ -51,6 +51,13 @@ def setup_rigid_body(prim):
     rigid_body.CreateKinematicEnabledAttr().Set(False)
 
     UsdPhysics.CollisionAPI.Apply(prim)
+
+    # Dynamic bodies can't use triangle-mesh collision, so use a convex hull.
+    if prim.IsA(UsdGeom.Mesh):
+        mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(prim)
+        mesh_collision.CreateApproximationAttr().Set(
+            UsdPhysics.Tokens.convexHull
+        )
 
     mass_api = UsdPhysics.MassAPI.Apply(prim)
     if not mass_api.GetMassAttr().HasAuthoredValueOpinion():
