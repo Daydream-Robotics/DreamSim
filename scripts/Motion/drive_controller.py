@@ -3,8 +3,9 @@
 Paste into the Script Editor and run. The script stops the timeline,
 installs the controller, then starts the simulation again.
 
-Every prim on the stage named ROBOT_PRIM_NAME is driven by the controls,
-so rename a prim in the Stage panel to make it controllable.
+Every prim on the stage whose CONTROLLABLE_ATTR is true is driven by the
+controls. To tag a prim, add a uniform Bool attribute with that name in
+the Property panel, tick it, then save the stage.
 
 Controls: W/S drive, A/D turn, Space clears all input.
 """
@@ -20,7 +21,7 @@ from pxr import Gf, PhysxSchema, UsdPhysics
 
 
 # Edit these settings; they're all really bad right now.
-ROBOT_PRIM_NAME = "robot_manipulable"
+CONTROLLABLE_ATTR = "dreamsim:controllable"
 
 DRIVE_FORCE = 40.0
 TURN_TORQUE = 0.5
@@ -34,11 +35,13 @@ STOP_TIMEOUT_FRAMES = 60
 
 
 def find_robot_prims(stage):
-    """Return every prim on the stage named ROBOT_PRIM_NAME."""
-    return [
-        prim for prim in stage.Traverse()
-        if prim.GetName() == ROBOT_PRIM_NAME
-    ]
+    """Return every prim on the stage whose CONTROLLABLE_ATTR is true."""
+    robot_prims = []
+    for prim in stage.Traverse():
+        attr = prim.GetAttribute(CONTROLLABLE_ATTR)
+        if attr.IsValid() and attr.Get():
+            robot_prims.append(prim)
+    return robot_prims
 
 
 def setup_rigid_body(prim):
@@ -65,7 +68,7 @@ def setup_rigid_body(prim):
     return force_api.CreateForceAttr(), force_api.CreateTorqueAttr()
 
 
-class TankController:
+class DriveController:
     def __init__(self):
         self.keys = set()
         self.keyboard_subscription = None
@@ -76,7 +79,8 @@ class TankController:
 
         if not self.prims:
             raise RuntimeError(
-                f"No prims named '{ROBOT_PRIM_NAME}' found on the stage."
+                f"No prims with '{CONTROLLABLE_ATTR}' set to true found "
+                "on the stage."
             )
 
         self.timeline = omni.timeline.get_timeline_interface()
@@ -198,7 +202,7 @@ async def load_tank_controls():
     else:
         raise RuntimeError("Isaac Sim did not finish stopping the timeline.")
 
-    _tank_controller = TankController()
+    _tank_controller = DriveController()
 
     # Start simulation after the controller has been installed.
     timeline.play()
