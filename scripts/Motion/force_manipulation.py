@@ -1,7 +1,10 @@
-"""Tank-style WASD controls for a physics cube in Isaac Sim.
+"""Tank-style WASD controls for robots in Isaac Sim.
 
 Paste into the Script Editor and run. The script stops the timeline,
 installs the controller, then starts the simulation again.
+
+Every prim on the stage named ROBOT_PRIM_NAME is driven by the controls,
+so rename a prim in the Stage panel to make it controllable.
 
 Controls: W/S drive, A/D turn, Space clears all input.
 """
@@ -17,7 +20,7 @@ from pxr import Gf, PhysxSchema, UsdPhysics
 
 
 # Edit these settings; they're all really bad right now.
-CUBE_PATH = "/World/FIELD_WITH_PHYSICS_MOVEMENT/Cube"
+ROBOT_PRIM_NAME = "robot_manipulable"
 
 DRIVE_FORCE = 40.0
 TURN_TORQUE = 0.5
@@ -30,45 +33,63 @@ DEFAULT_MASS = 5.0
 STOP_TIMEOUT_FRAMES = 60
 
 
-class TankCubeController:
+def find_robot_prims(stage):
+    """Return every prim on the stage named ROBOT_PRIM_NAME."""
+    return [
+        prim for prim in stage.Traverse()
+        if prim.GetName() == ROBOT_PRIM_NAME
+    ]
+
+
+def setup_rigid_body(prim):
+    """Make the prim a dynamic rigid body and return its force attributes."""
+    rigid_body = UsdPhysics.RigidBodyAPI.Apply(prim)
+    rigid_body.CreateRigidBodyEnabledAttr().Set(True)
+    rigid_body.CreateKinematicEnabledAttr().Set(False)
+
+    UsdPhysics.CollisionAPI.Apply(prim)
+
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    if not mass_api.GetMassAttr().HasAuthoredValueOpinion():
+        mass_api.CreateMassAttr().Set(DEFAULT_MASS)
+
+    physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    physx_body.CreateLinearDampingAttr().Set(LINEAR_DAMPING)
+    physx_body.CreateAngularDampingAttr().Set(ANGULAR_DAMPING)
+
+    force_api = PhysxSchema.PhysxForceAPI.Apply(prim)
+    force_api.CreateModeAttr().Set("force")
+    force_api.CreateWorldFrameEnabledAttr().Set(False)
+    force_api.CreateForceEnabledAttr().Set(True)
+
+    return force_api.CreateForceAttr(), force_api.CreateTorqueAttr()
+
+
+class TankController:
     def __init__(self):
         self.keys = set()
         self.keyboard_subscription = None
         self.timeline_subscription = None
 
         self.stage = omni.usd.get_context().get_stage()
-        self.prim = self.stage.GetPrimAtPath(CUBE_PATH)
+        self.prims = find_robot_prims(self.stage)
 
-        if not self.prim.IsValid():
-            raise RuntimeError(f"No cube found at {CUBE_PATH}.")
+        if not self.prims:
+            raise RuntimeError(
+                f"No prims named '{ROBOT_PRIM_NAME}' found on the stage."
+            )
 
         self.timeline = omni.timeline.get_timeline_interface()
 
         if not self.timeline.is_stopped():
             raise RuntimeError("Timeline must be stopped; run again.")
 
-        rigid_body = UsdPhysics.RigidBodyAPI.Apply(self.prim)
-        rigid_body.CreateRigidBodyEnabledAttr().Set(True)
-        rigid_body.CreateKinematicEnabledAttr().Set(False)
-
-        UsdPhysics.CollisionAPI.Apply(self.prim)
-
-        mass_api = UsdPhysics.MassAPI.Apply(self.prim)
-        mass_attr = mass_api.GetMassAttr()
-        if not mass_attr.HasAuthoredValueOpinion():
-            mass_api.CreateMassAttr().Set(DEFAULT_MASS)
-
-        physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(self.prim)
-        physx_body.CreateLinearDampingAttr().Set(LINEAR_DAMPING)
-        physx_body.CreateAngularDampingAttr().Set(ANGULAR_DAMPING)
-
-        self.force_api = PhysxSchema.PhysxForceAPI.Apply(self.prim)
-        self.force_api.CreateModeAttr().Set("force")
-        self.force_api.CreateWorldFrameEnabledAttr().Set(False)
-        self.force_api.CreateForceEnabledAttr().Set(True)
-
-        self.force_attr = self.force_api.CreateForceAttr()
-        self.torque_attr = self.force_api.CreateTorqueAttr()
+        self.force_attrs = []
+        self.torque_attrs = []
+        for prim in self.prims:
+            force_attr, torque_attr = setup_rigid_body(prim)
+            self.force_attrs.append(force_attr)
+            self.torque_attrs.append(torque_attr)
         self.clear_input()
 
         self.input = carb.input.acquire_input_interface()
@@ -83,7 +104,8 @@ class TankCubeController:
             self.on_timeline_event
         )
 
-        print("Tank cube controller loaded.")
+        paths = ", ".join(str(prim.GetPath()) for prim in self.prims)
+        print(f"Tank controller loaded for: {paths}")
 
     def update_forces(self):
         key = carb.input.KeyboardInput
@@ -91,8 +113,18 @@ class TankCubeController:
         drive = int(key.W in self.keys) - int(key.S in self.keys)
         steer = int(key.A in self.keys) - int(key.D in self.keys)
 
-        self.force_attr.Set(Gf.Vec3f(drive * DRIVE_FORCE, 0.0, 0.0))
-        self.torque_attr.Set(Gf.Vec3f(0.0, 0.0, steer * TURN_TORQUE))
+        self.set_forces(
+            Gf.Vec3f(drive * DRIVE_FORCE, 0.0, 0.0),
+            Gf.Vec3f(0.0, 0.0, steer * TURN_TORQUE),
+        )
+
+    def set_forces(self, force, torque):
+        for prim, force_attr, torque_attr in zip(
+            self.prims, self.force_attrs, self.torque_attrs
+        ):
+            if prim.IsValid():
+                force_attr.Set(force)
+                torque_attr.Set(torque)
 
     def on_keyboard(self, event, *args):
         key = carb.input.KeyboardInput
@@ -128,9 +160,7 @@ class TankCubeController:
 
     def clear_input(self):
         self.keys.clear()
-        if self.prim.IsValid():
-            self.force_attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
-            self.torque_attr.Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        self.set_forces(Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(0.0, 0.0, 0.0))
 
     def shutdown(self):
         self.clear_input()
@@ -145,16 +175,16 @@ class TankCubeController:
 
 
 async def load_tank_controls():
-    global _tank_cube_controller
+    global _tank_controller
 
     app = omni.kit.app.get_app()
     timeline = omni.timeline.get_timeline_interface()
 
     # Tear down the controller from a previous run in this Script Editor.
-    previous_controller = globals().get("_tank_cube_controller")
+    previous_controller = globals().get("_tank_controller")
     if previous_controller is not None:
         previous_controller.shutdown()
-    _tank_cube_controller = None
+    _tank_controller = None
 
     # Request Stop and let Isaac Sim process the state change.
     timeline.stop()
@@ -168,7 +198,7 @@ async def load_tank_controls():
     else:
         raise RuntimeError("Isaac Sim did not finish stopping the timeline.")
 
-    _tank_cube_controller = TankCubeController()
+    _tank_controller = TankController()
 
     # Start simulation after the controller has been installed.
     timeline.play()
