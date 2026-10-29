@@ -1,22 +1,33 @@
+"""Tank-style WASD controls for a physics cube in Isaac Sim.
+
+Paste into the Script Editor and run. The script stops the timeline,
+installs the controller, then starts the simulation again.
+
+Controls: W/S drive, A/D turn, Space clears all input.
+"""
+
+import asyncio
+
 import carb
 import omni.appwindow
+import omni.kit.app
 import omni.timeline
 import omni.usd
-
 from pxr import Gf, PhysxSchema, UsdPhysics
 
 
-# EDIT THESE SETTINGS they're all rlly bad rn 
+# Edit these settings; they're all really bad right now.
+CUBE_PATH = "/World/FIELD_WITH_PHYSICS_MOVEMENT/Cube"
 
-CUBE_PATH = "/World/Cube"
+DRIVE_FORCE = 40.0
+TURN_TORQUE = 0.5
 
-DRIVE_FORCE = 40.0       
-TURN_TORQUE = 0.5     
+LINEAR_DAMPING = 1.0
+ANGULAR_DAMPING = 3.0
+DEFAULT_MASS = 5.0
 
-LINEAR_DAMPING = 1.0   
-ANGULAR_DAMPING = 3.0   
-DEFAULT_MASS = 5.0     
-
+# Frames to wait for the timeline to report that it has stopped.
+STOP_TIMEOUT_FRAMES = 60
 
 
 class TankCubeController:
@@ -29,23 +40,17 @@ class TankCubeController:
         self.prim = self.stage.GetPrimAtPath(CUBE_PATH)
 
         if not self.prim.IsValid():
-            raise RuntimeError(
-                f"no cube found"
-            )
+            raise RuntimeError(f"No cube found at {CUBE_PATH}.")
 
         self.timeline = omni.timeline.get_timeline_interface()
 
-       
         if not self.timeline.is_stopped():
-            raise RuntimeError(
-                "run again"
-            )
+            raise RuntimeError("Timeline must be stopped; run again.")
 
         rigid_body = UsdPhysics.RigidBodyAPI.Apply(self.prim)
         rigid_body.CreateRigidBodyEnabledAttr().Set(True)
         rigid_body.CreateKinematicEnabledAttr().Set(False)
 
-        
         UsdPhysics.CollisionAPI.Apply(self.prim)
 
         mass_api = UsdPhysics.MassAPI.Apply(self.prim)
@@ -67,25 +72,18 @@ class TankCubeController:
         self.clear_input()
 
         self.input = carb.input.acquire_input_interface()
-        self.keyboard = (
-            omni.appwindow.get_default_app_window().get_keyboard()
+        self.keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+
+        self.keyboard_subscription = self.input.subscribe_to_keyboard_events(
+            self.keyboard, self.on_keyboard
         )
 
-        self.keyboard_subscription = (
-            self.input.subscribe_to_keyboard_events(
-                self.keyboard, self.on_keyboard
-            )
+        event_stream = self.timeline.get_timeline_event_stream()
+        self.timeline_subscription = event_stream.create_subscription_to_pop(
+            self.on_timeline_event
         )
 
-        self.timeline_subscription = (
-            self.timeline.get_timeline_event_stream().create_subscription_to_pop(
-                self.on_timeline_event
-            )
-        )
-
-        print(
-            f"the thing loaded"
-        )
+        print("Tank cube controller loaded.")
 
     def update_forces(self):
         key = carb.input.KeyboardInput
@@ -93,12 +91,8 @@ class TankCubeController:
         drive = int(key.W in self.keys) - int(key.S in self.keys)
         steer = int(key.A in self.keys) - int(key.D in self.keys)
 
-        self.force_attr.Set(
-            Gf.Vec3f(drive * DRIVE_FORCE, 0.0, 0.0)
-        )
-        self.torque_attr.Set(
-            Gf.Vec3f(0.0, 0.0, steer * TURN_TORQUE)
-        )
+        self.force_attr.Set(Gf.Vec3f(drive * DRIVE_FORCE, 0.0, 0.0))
+        self.torque_attr.Set(Gf.Vec3f(0.0, 0.0, steer * TURN_TORQUE))
 
     def on_keyboard(self, event, *args):
         key = carb.input.KeyboardInput
@@ -150,10 +144,34 @@ class TankCubeController:
         self.timeline_subscription = None
 
 
+async def load_tank_controls():
+    global _tank_cube_controller
 
-_previous_controller = globals().get("_tank_cube_controller")
-if _previous_controller is not None:
-    _previous_controller.shutdown()
+    app = omni.kit.app.get_app()
+    timeline = omni.timeline.get_timeline_interface()
 
-_tank_cube_controller = None
-_tank_cube_controller = TankCubeController()
+    # Tear down the controller from a previous run in this Script Editor.
+    previous_controller = globals().get("_tank_cube_controller")
+    if previous_controller is not None:
+        previous_controller.shutdown()
+    _tank_cube_controller = None
+
+    # Request Stop and let Isaac Sim process the state change.
+    timeline.stop()
+    await app.next_update_async()
+
+    # Wait until the timeline actually reports that it has stopped.
+    for _ in range(STOP_TIMEOUT_FRAMES):
+        if timeline.is_stopped():
+            break
+        await app.next_update_async()
+    else:
+        raise RuntimeError("Isaac Sim did not finish stopping the timeline.")
+
+    _tank_cube_controller = TankCubeController()
+
+    # Start simulation after the controller has been installed.
+    timeline.play()
+
+
+_tank_loader_task = asyncio.ensure_future(load_tank_controls())
