@@ -1,0 +1,64 @@
+[project]
+name = "dreamsim"
+version = "0.1.0"
+# Isaac Sim 6.1's bundled interpreter is CPython 3.12
+requires-python = "==3.12.*"
+dependencies = [
+    # Isaac Lab's root project: pulls in its packages and pinned third-party deps.
+    # No [isaacsim] extra on purpose, Isaac Sim comes from the standalone install (see setup.md)
+    "isaaclab-dev",
+]
+
+[tool.uv]
+# no importable dreamsim package yet, only the environment
+package = false
+# mirrored from Isaac Lab v3.0.0-EA's pyproject, uv doesn't inherit these from a dependency
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
+environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+override-dependencies = [
+    # must match the numpy Isaac Sim 6.1 prebundles (its scipy is built against it);
+    # Isaac Lab only needs >=2, and a newer venv numpy breaks isaacsim.core extensions
+    "numpy==2.3.1",
+    "mujoco~=3.11.0",
+    "mujoco-warp~=3.11.0",
+    "newton[sim]==1.5.2",
+    "newton-usd-schemas>=0.4.1",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
+    "packaging>=20,<27",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com"
+
+[[tool.uv.index]]
+name = "pypi-public"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+# v3.0.0-EA is the Isaac Lab release that targets Isaac Sim 6.1
+isaaclab-dev = { git = "https://github.com/isaac-sim/IsaacLab.git", tag = "v3.0.0-EA" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+omniverseclient = { index = "pypi-public" }
+ovphysx = { index = "pypi-public" }
+ovrtx = { index = "pypi-public" }
+ovstage = { index = "pypi-public" }
+
+[dependency-groups]
+dev = [
+    "cmake>=3.18",
+    "ninja>=1.13.2",
+]
