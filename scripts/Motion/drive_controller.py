@@ -76,19 +76,11 @@ def setup_rigid_body(prim):
 
 
 class DriveController:
-    def __init__(self):
+    def __init__(self, prims):
         self.keys = set()
         self.keyboard_subscription = None
         self.timeline_subscription = None
-
-        self.stage = omni.usd.get_context().get_stage()
-        self.prims = find_robot_prims(self.stage)
-
-        if not self.prims:
-            raise RuntimeError(
-                f"No prims with '{CONTROLLABLE_ATTR}' set to true found "
-                "on the stage."
-            )
+        self.prims = prims
 
         self.timeline = omni.timeline.get_timeline_interface()
 
@@ -197,6 +189,17 @@ async def load_tank_controls():
         previous_controller.shutdown()
     _tank_controller = None
 
+    # Check before touching the timeline so nothing changes when no prim is
+    # tagged.
+    stage = omni.usd.get_context().get_stage()
+    prims = find_robot_prims(stage)
+    if not prims:
+        carb.log_error(
+            f"Drive controller not loaded: no prims with "
+            f"'{CONTROLLABLE_ATTR}' set to true on the stage."
+        )
+        return
+
     # Request Stop and let Isaac Sim process the state change.
     timeline.stop()
     await app.next_update_async()
@@ -207,9 +210,16 @@ async def load_tank_controls():
             break
         await app.next_update_async()
     else:
-        raise RuntimeError("Isaac Sim did not finish stopping the timeline.")
+        carb.log_error("Isaac Sim did not finish stopping the timeline.")
+        return
 
-    _tank_controller = DriveController()
+    # Exceptions raised inside this task are not shown in the Script
+    # Editor, so log them explicitly.
+    try:
+        _tank_controller = DriveController(prims)
+    except Exception as error:
+        carb.log_error(f"Drive controller failed to load: {error}")
+        return
 
     # Start simulation after the controller has been installed.
     timeline.play()
