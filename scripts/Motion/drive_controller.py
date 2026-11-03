@@ -1,51 +1,87 @@
-"""Tank-style WASD controls for robots in Isaac Sim.
+"""Tank-drive WASD controls for robots in Isaac Sim.
 
 Paste into the Script Editor and run. The script stops the timeline,
 installs the controller, then starts the simulation again.
 
-Every prim on the stage whose CONTROLLABLE_ATTR is true is driven by the
-controls. To tag a prim, add a uniform Bool attribute with that name in
+Every prim on the stage whose config.CONTROLLABLE_ATTR is true is driven by
+the controls. To tag a prim, add a uniform Bool attribute with that name in
 the Property panel, tick it, then save the stage.
 
-Controls: W/S drive, A/D turn, Space clears all input.
+Controls: W/S drive, A/D turn, Space clears all input. The keys are mixed
+into left/right side voltages, the same inputs robot-core's MPC produces.
+Each physics step, every side's voltage and wheel speed go through a V5
+motor model to get that side's wheel force.
+
+Settings live in drive_config.py next to this file, which reads the
+robot's values from robot-core. Edits to either take effect on re-run.
 """
 
 import asyncio
+import importlib
+import math
+import sys
+from pathlib import Path
 
 import carb
+import numpy as np
 import omni.appwindow
 import omni.kit.app
 import omni.timeline
 import omni.usd
-from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics
+from isaacsim.core.experimental.prims import RigidPrim
+from isaacsim.core.simulation_manager import 
+    SimulationEvent,
+    SimulationManager,
+)
+from pxr import PhysxSchema, UsdGeom, UsdPhysics
 
 
-# Edit these settings; they're all really bad right now.
-CONTROLLABLE_ATTR = "dreamsim:controllable"
+def find_motion_dir():
+    """Find scripts/Motion from this file or from the open scene's path.
 
-DRIVE_FORCE = 40.0
-TURN_TORQUE = 0.5
+    Code pasted into the Script Editor has no __file__, so fall back to
+    searching upward from the scene, which lives in the same repo.
+    """
+    candidates = []
+    if "__file__" in globals():
+        candidates.append(Path(__file__).resolve().parent)
+    stage = omni.usd.get_context().get_stage()
+    scene_path = stage.GetRootLayer().realPath if stage else ""
+    if scene_path:
+        for parent in Path(scene_path).resolve().parents:
+            candidates.append(parent / "scripts" / "Motion")
 
-LINEAR_DAMPING = 1.0
-ANGULAR_DAMPING = 3.0
-DEFAULT_MASS = 5.0
+    for candidate in candidates:
+        if (candidate / "drive_config.py").is_file():
+            return candidate
+    raise RuntimeError(
+        "Couldn't find scripts/Motion/drive_config.py. Open a scene from "
+        "the DreamSim repo with File > Open, then run this again."
+    )
 
-# Frames to wait for the timeline to report that it has stopped.
-STOP_TIMEOUT_FRAMES = 60
+
+_motion_dir = str(find_motion_dir())
+if _motion_dir not in sys.path:
+    sys.path.insert(0, _motion_dir)
+
+import drive_config as config  # noqa: E402
+
+# Reload so edits to drive_config.py or robot-core apply without a restart.
+config = importlib.reload(config)
 
 
 def find_robot_prims(stage):
-    """Return every prim on the stage whose CONTROLLABLE_ATTR is true."""
+    """Return every prim on the stage tagged as controllable."""
     robot_prims = []
     for prim in stage.Traverse():
-        attr = prim.GetAttribute(CONTROLLABLE_ATTR)
+        attr = prim.GetAttribute(config.CONTROLLABLE_ATTR)
         if attr.IsValid() and attr.Get():
             robot_prims.append(prim)
     return robot_prims
 
 
 def setup_rigid_body(prim):
-    """Make the prim a dynamic rigid body and return its force attributes."""
+    """Make the prim a dynamic rigid body."""
     rigid_body = UsdPhysics.RigidBodyAPI.Apply(prim)
     rigid_body.CreateRigidBodyEnabledAttr().Set(True)
     rigid_body.CreateKinematicEnabledAttr().Set(False)
@@ -61,18 +97,51 @@ def setup_rigid_body(prim):
 
     mass_api = UsdPhysics.MassAPI.Apply(prim)
     if not mass_api.GetMassAttr().HasAuthoredValueOpinion():
-        mass_api.CreateMassAttr().Set(DEFAULT_MASS)
+        mass_api.CreateMassAttr().Set(config.DEFAULT_MASS)
 
     physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-    physx_body.CreateLinearDampingAttr().Set(LINEAR_DAMPING)
-    physx_body.CreateAngularDampingAttr().Set(ANGULAR_DAMPING)
+    physx_body.CreateLinearDampingAttr().Set(config.LINEAR_DAMPING)
+    physx_body.CreateAngularDampingAttr().Set(config.ANGULAR_DAMPING)
 
-    force_api = PhysxSchema.PhysxForceAPI.Apply(prim)
-    force_api.CreateModeAttr().Set("force")
-    force_api.CreateWorldFrameEnabledAttr().Set(False)
-    force_api.CreateForceEnabledAttr().Set(True)
 
-    return force_api.CreateForceAttr(), force_api.CreateTorqueAttr()
+def arcade_to_tank(drive, steer):
+    """Mix drive and steer in [-1, 1] into (left, right) side voltages."""
+    left = drive - steer
+    right = drive + steer
+    # Scale both sides down together so turning still works at full drive.
+    scale = max(1.0, abs(left), abs(right))
+    max_voltage = config.MAX_VOLTAGE
+    return max_voltage * left / scale, max_voltage * right / scale
+
+
+def motor_torque(voltage, motor_speed):
+    """Output torque of one motor from its voltage and speed (rad/s)."""
+    back_emf = motor_speed / config.MOTOR_KV
+    current = (voltage - back_emf) / config.MOTOR_RESISTANCE
+    current = max(-config.CURRENT_LIMIT, min(config.CURRENT_LIMIT, current))
+    return config.MOTOR_KT * current
+
+
+def side_force(voltage, ground_speed):
+    """Force one drive side puts on the ground, from its ground speed."""
+    wheel_speed = ground_speed / config.WHEEL_RADIUS
+    motor_speed = wheel_speed / config.DRIVE_GEAR_RATIO
+    torque = motor_torque(voltage, motor_speed)
+    wheel_torque = config.MOTORS_PER_SIDE * torque / config.DRIVE_GEAR_RATIO
+    return wheel_torque / config.WHEEL_RADIUS
+
+
+def quaternion_to_yaw(quaternion):
+    """Yaw about Z from an Isaac Sim [w, x, y, z] quaternion."""
+    w, x, y, z = quaternion
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def to_numpy(value):
+    """Convert Warp/Isaac arrays to NumPy arrays."""
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
 
 
 class DriveController:
@@ -80,20 +149,23 @@ class DriveController:
         self.keys = set()
         self.keyboard_subscription = None
         self.timeline_subscription = None
+        self.physics_callback = None
         self.prims = prims
+        self.v_left = 0.0
+        self.v_right = 0.0
 
         self.timeline = omni.timeline.get_timeline_interface()
 
         if not self.timeline.is_stopped():
             raise RuntimeError("Timeline must be stopped; run again.")
 
-        self.force_attrs = []
-        self.torque_attrs = []
         for prim in self.prims:
-            force_attr, torque_attr = setup_rigid_body(prim)
-            self.force_attrs.append(force_attr)
-            self.torque_attrs.append(torque_attr)
-        self.clear_input()
+            setup_rigid_body(prim)
+        self.robots = RigidPrim([str(prim.GetPath()) for prim in self.prims])
+
+        self.physics_callback = SimulationManager.register_callback(
+            self.on_physics_step, event=SimulationEvent.PHYSICS_PRE_STEP
+        )
 
         self.input = carb.input.acquire_input_interface()
         self.keyboard = omni.appwindow.get_default_app_window().get_keyboard()
@@ -110,24 +182,63 @@ class DriveController:
         paths = ", ".join(str(prim.GetPath()) for prim in self.prims)
         print(f"Tank controller loaded for: {paths}")
 
-    def update_forces(self):
+        # Compare the motor model with the robot's identified model.
+        model_speed = (
+            config.MAX_VOLTAGE * config.MOTOR_KV * config.DRIVE_GEAR_RATIO
+        )
+        robot_speed = config.MAX_VOLTAGE * config.MOTOR_B / config.MOTOR_A
+        print(
+            f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
+            f"{model_speed:.1f} rad/s, robot-core {robot_speed:.1f} rad/s"
+        )
+
+    def update_voltages(self):
         key = carb.input.KeyboardInput
 
         drive = int(key.W in self.keys) - int(key.S in self.keys)
         steer = int(key.A in self.keys) - int(key.D in self.keys)
 
-        self.set_forces(
-            Gf.Vec3f(drive * DRIVE_FORCE, 0.0, 0.0),
-            Gf.Vec3f(0.0, 0.0, steer * TURN_TORQUE),
-        )
+        self.set_voltages(*arcade_to_tank(drive, steer))
 
-    def set_forces(self, force, torque):
-        for prim, force_attr, torque_attr in zip(
-            self.prims, self.force_attrs, self.torque_attrs
-        ):
-            if prim.IsValid():
-                force_attr.Set(force)
-                torque_attr.Set(torque)
+    def set_voltages(self, v_left, v_right):
+        """Set the side voltages, clamped to +/-config.MAX_VOLTAGE."""
+        max_voltage = config.MAX_VOLTAGE
+        self.v_left = max(-max_voltage, min(max_voltage, v_left))
+        self.v_right = max(-max_voltage, min(max_voltage, v_right))
+
+    def on_physics_step(self, dt, context):
+        if not self.robots.is_physics_tensor_entity_valid():
+            return
+
+        _, orientations = self.robots.get_world_poses()
+        linear_velocities, angular_velocities = self.robots.get_velocities()
+        orientations = to_numpy(orientations)
+        linear_velocities = to_numpy(linear_velocities)
+        angular_velocities = to_numpy(angular_velocities)
+
+        forces = np.zeros((len(self.prims), 3), dtype=np.float32)
+        torques = np.zeros((len(self.prims), 3), dtype=np.float32)
+        for i in range(len(self.prims)):
+            yaw = quaternion_to_yaw(orientations[i])
+            forward_speed = (
+                linear_velocities[i][0] * math.cos(yaw)
+                + linear_velocities[i][1] * math.sin(yaw)
+            )
+            yaw_rate = angular_velocities[i][2]
+
+            half_track = config.TRACK_WIDTH / 2.0
+            left_speed = forward_speed - yaw_rate * half_track
+            right_speed = forward_speed + yaw_rate * half_track
+            left_force = side_force(self.v_left, left_speed)
+            right_force = side_force(self.v_right, right_speed)
+
+            # Two side forces equal one net force plus a yaw torque.
+            forces[i][0] = left_force + right_force
+            torques[i][2] = (right_force - left_force) * half_track
+
+        self.robots.apply_forces_and_torques_at_pos(
+            forces=forces, torques=torques, local_frame=True
+        )
 
     def on_keyboard(self, event, *args):
         key = carb.input.KeyboardInput
@@ -151,7 +262,7 @@ class DriveController:
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             self.keys.discard(event.input)
 
-        self.update_forces()
+        self.update_voltages()
         return True
 
     def on_timeline_event(self, event):
@@ -163,10 +274,14 @@ class DriveController:
 
     def clear_input(self):
         self.keys.clear()
-        self.set_forces(Gf.Vec3f(0.0, 0.0, 0.0), Gf.Vec3f(0.0, 0.0, 0.0))
+        self.set_voltages(0.0, 0.0)
 
     def shutdown(self):
         self.clear_input()
+
+        if self.physics_callback is not None:
+            SimulationManager.deregister_callback(self.physics_callback)
+            self.physics_callback = None
 
         if self.keyboard_subscription is not None:
             self.input.unsubscribe_to_keyboard_events(
@@ -196,7 +311,7 @@ async def load_tank_controls():
     if not prims:
         carb.log_error(
             f"Drive controller not loaded: no prims with "
-            f"'{CONTROLLABLE_ATTR}' set to true on the stage."
+            f"'{config.CONTROLLABLE_ATTR}' set to true on the stage."
         )
         return
 
@@ -205,7 +320,7 @@ async def load_tank_controls():
     await app.next_update_async()
 
     # Wait until the timeline actually reports that it has stopped.
-    for _ in range(STOP_TIMEOUT_FRAMES):
+    for _ in range(config.STOP_TIMEOUT_FRAMES):
         if timeline.is_stopped():
             break
         await app.next_update_async()
