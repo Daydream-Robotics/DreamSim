@@ -176,26 +176,34 @@ def clamp(value, limit):
     return max(-limit, min(limit, value))
 
 
-def motor_torque(voltage, motor_speed):
-    """Output torque of one motor from its voltage and speed (rad/s)."""
+def motor_torque(voltage, motor_speed, brake=False):
+    """Output torque of one motor from its voltage and speed (rad/s).
+
+    At exactly 0 V the motor coasts (no torque) unless brake is set or
+    config.DRIVE_BRAKE_MODE is "brake".
+    """
+    if voltage == 0.0 and not brake and config.DRIVE_BRAKE_MODE == "coast":
+        return 0.0
     back_emf = motor_speed / config.MOTOR_KV
     current = (voltage - back_emf) / config.MOTOR_RESISTANCE
     current = clamp(current, config.CURRENT_LIMIT)
     return config.MOTOR_KT * current
 
 
-def side_force(voltage, ground_speed):
+def side_force(voltage, ground_speed, brake=False):
     """Force one drive side puts on the ground, from its ground speed."""
     wheel_speed = ground_speed / config.WHEEL_RADIUS
     motor_speed = wheel_speed / config.DRIVE_GEAR_RATIO
-    torque = motor_torque(voltage, motor_speed)
+    torque = motor_torque(voltage, motor_speed, brake)
     wheel_torque = config.MOTORS_PER_SIDE * torque / config.DRIVE_GEAR_RATIO
     return wheel_torque / config.WHEEL_RADIUS
 
 
 def drive_wrench(v_left, v_right, forward_speed, sideways_speed, yaw_rate,
-                 dt):
+                 dt, brake=False):
     """Net body-frame force (x, y) and yaw torque from all the wheels.
+
+    brake makes sides at 0 V brake even when the drive is set to coast.
 
     Speeds are in the robot's frame: x forward, y left, z up.
     """
@@ -203,8 +211,9 @@ def drive_wrench(v_left, v_right, forward_speed, sideways_speed, yaw_rate,
     normal_force = config.ROBOT_MASS * config.GRAVITY / wheel_count
     rolling_limit = config.WHEEL_ROLLING_FRICTION * normal_force
     sideways_limit = config.WHEEL_SIDEWAYS_FRICTION * normal_force
-    # Sideways force per m/s of slip that removes GRIP_RESPONSE of a
-    # wheel's slip in one step.
+    resistance_limit = config.WHEEL_ROLLING_RESISTANCE * normal_force
+    # Force per m/s of slip that removes GRIP_RESPONSE of a wheel's slip in
+    # one step. Used for sideways grip and rolling resistance.
     grip_gain = config.GRIP_RESPONSE * config.ROBOT_MASS / wheel_count / dt
 
     force_x = 0.0
@@ -213,25 +222,35 @@ def drive_wrench(v_left, v_right, forward_speed, sideways_speed, yaw_rate,
     half_track = config.TRACK_WIDTH / 2.0
     for side_y, voltage in ((half_track, v_left), (-half_track, v_right)):
         side_speed = forward_speed - yaw_rate * side_y
-        per_wheel = side_force(voltage, side_speed) / config.WHEELS_PER_SIDE
+        side = side_force(voltage, side_speed, brake)
+        per_wheel = side / config.WHEELS_PER_SIDE
         # Beyond the friction limit the wheel spins instead of pushing.
         drive = clamp(per_wheel, rolling_limit)
+        # Resistance opposes rolling and holds the robot once stopped.
+        resistance = clamp(-grip_gain * side_speed, resistance_limit)
+        push = drive + resistance
 
         for wheel_x in config.WHEEL_X_POSITIONS:
             slip = sideways_speed + yaw_rate * wheel_x
             grip = clamp(-grip_gain * slip, sideways_limit)
 
-            force_x += drive
+            force_x += push
             force_y += grip
-            torque_z += wheel_x * grip - side_y * drive
+            torque_z += wheel_x * grip - side_y * push
 
     return force_x, force_y, torque_z
 
 
-def quaternion_to_yaw(quaternion):
-    """Yaw about Z from an Isaac Sim [w, x, y, z] quaternion."""
-    w, x, y, z = quaternion
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+def quaternion_to_matrix(quaternion):
+    """Body-to-world rotation matrix from an Isaac Sim [w, x, y, z]
+    quaternion. Its columns are the body's x, y and z axes in world space.
+    """
+    w, x, y, z = quaternion / np.linalg.norm(quaternion)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
 
 
 def to_numpy(value):
@@ -250,6 +269,10 @@ class DriveController:
         self.prims = prims
         self.v_left = 0.0
         self.v_right = 0.0
+        self.brake = config.KEYBOARD_BRAKE_ON_RELEASE
+        self.status_time = 0.0
+        self.voltages_changed = False
+        self.rate_checked = False
 
         self.timeline = omni.timeline.get_timeline_interface()
 
@@ -289,6 +312,7 @@ class DriveController:
             f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
             f"{model_speed:.1f} rad/s, robot-core {robot_speed:.1f} rad/s"
         )
+        print(f"Config: {config.__file__}")
         print(
             f"Physics: {config.PHYSICS_STEPS_PER_SECOND} steps/s, "
             f"{config.STEPS_PER_CONTROL_PERIOD} per "
@@ -301,12 +325,23 @@ class DriveController:
         drive = int(key.W in self.keys) - int(key.S in self.keys)
         steer = int(key.A in self.keys) - int(key.D in self.keys)
 
-        self.set_voltages(*arcade_to_tank(drive, steer))
+        # Letting go of every key brakes, if the config asks for it.
+        released = drive == 0 and steer == 0
+        brake = released and config.KEYBOARD_BRAKE_ON_RELEASE
+        self.set_voltages(*arcade_to_tank(drive, steer), brake=brake)
 
-    def set_voltages(self, v_left, v_right):
-        """Set the side voltages, clamped to +/-config.MAX_VOLTAGE."""
-        self.v_left = clamp(v_left, config.MAX_VOLTAGE)
-        self.v_right = clamp(v_right, config.MAX_VOLTAGE)
+    def set_voltages(self, v_left, v_right, brake=False):
+        """Set the side voltages, clamped to +/-config.MAX_VOLTAGE.
+
+        brake makes sides at 0 V brake even when the drive is set to coast.
+        """
+        v_left = clamp(v_left, config.MAX_VOLTAGE)
+        v_right = clamp(v_right, config.MAX_VOLTAGE)
+        if (v_left, v_right, brake) != (self.v_left, self.v_right, self.brake):
+            self.voltages_changed = True
+        self.v_left = v_left
+        self.v_right = v_right
+        self.brake = brake
 
     def on_physics_step(self, dt, context):
         # drive_wrench divides by dt, so skip zero-length steps.
@@ -319,18 +354,41 @@ class DriveController:
         linear_velocities = to_numpy(linear_velocities)
         angular_velocities = to_numpy(angular_velocities)
 
+        if not self.rate_checked:
+            self.rate_checked = True
+            self.check_physics_rate(dt)
+
+        # Print on a fixed interval, and on the step a key press or release
+        # changes the voltages so the instant of the change is captured.
+        self.status_time += dt
+        print_status = config.STATUS_INTERVAL > 0.0 and (
+            self.status_time >= config.STATUS_INTERVAL
+            or self.voltages_changed
+        )
+        if print_status:
+            self.status_time = 0.0
+            self.voltages_changed = False
+
         forces = np.zeros((len(self.prims), 3), dtype=np.float32)
         torques = np.zeros((len(self.prims), 3), dtype=np.float32)
         for i in range(len(self.prims)):
-            yaw = quaternion_to_yaw(orientations[i])
-            velocity_x, velocity_y = linear_velocities[i][:2]
-            forward_speed = (
-                velocity_x * math.cos(yaw) + velocity_y * math.sin(yaw)
-            )
-            sideways_speed = (
-                -velocity_x * math.sin(yaw) + velocity_y * math.cos(yaw)
-            )
-            yaw_rate = angular_velocities[i][2]
+            # Measure motion in the robot's own frame, the same frame the
+            # forces are applied in (local_frame=True below).
+            rotation = quaternion_to_matrix(orientations[i])
+            body_velocity = rotation.T @ linear_velocities[i]
+            body_angular_velocity = rotation.T @ angular_velocities[i]
+            forward_speed, sideways_speed = body_velocity[:2]
+            yaw_rate = body_angular_velocity[2]
+
+            # Tipped over: the wheels aren't on the ground.
+            tipped = rotation[2][2] < math.cos(config.MAX_WHEEL_TILT)
+            if tipped:
+                if print_status:
+                    self.print_status(
+                        i, forward_speed, sideways_speed, yaw_rate,
+                        tipped=True,
+                    )
+                continue
 
             # TODO(real robot): the wheel forces are summed about the body
             # origin, which assumes the centre of mass is there, and they
@@ -340,14 +398,51 @@ class DriveController:
             # positions) so an off-centre mass and pitching show up.
             force_x, force_y, torque_z = drive_wrench(
                 self.v_left, self.v_right,
-                forward_speed, sideways_speed, yaw_rate, dt,
+                forward_speed, sideways_speed, yaw_rate, dt, self.brake,
             )
             forces[i][0] = force_x
             forces[i][1] = force_y
             torques[i][2] = torque_z
 
+            if print_status:
+                self.print_status(
+                    i, forward_speed, sideways_speed, yaw_rate
+                )
+
         self.robots.apply_forces_and_torques_at_pos(
             forces=forces, torques=torques, local_frame=True
+        )
+
+    def check_physics_rate(self, dt):
+        """Report the rate PhysX actually runs at, from the step length."""
+        actual_rate = 1.0 / dt
+        print(f"Physics running at {actual_rate:.0f} steps/s")
+        if not math.isclose(
+            actual_rate, config.PHYSICS_STEPS_PER_SECOND, rel_tol=0.01
+        ):
+            carb.log_warn(
+                f"Physics is running at {actual_rate:.0f} steps/s, not the "
+                f"configured {config.PHYSICS_STEPS_PER_SECOND}. Something "
+                "else is setting the physics rate."
+            )
+
+    def print_status(self, index, forward_speed, sideways_speed, yaw_rate,
+                     tipped=False):
+        """Print one robot's motion, skipping robots sitting still."""
+        moving = (
+            abs(forward_speed) > 0.01
+            or abs(sideways_speed) > 0.01
+            or abs(yaw_rate) > 0.05
+        )
+        if not moving and self.v_left == 0.0 and self.v_right == 0.0:
+            return
+        print(
+            f"{self.prims[index].GetPath()}: "
+            f"V {self.v_left:+5.1f}/{self.v_right:+5.1f}  "
+            f"forward {forward_speed / config.INCH:+6.1f} in/s  "
+            f"sideways {sideways_speed / config.INCH:+6.1f} in/s  "
+            f"turn {math.degrees(yaw_rate):+6.0f} deg/s"
+            + ("  TIPPED, wheels off" if tipped else "")
         )
 
     def on_keyboard(self, event, *args):
@@ -384,7 +479,9 @@ class DriveController:
 
     def clear_input(self):
         self.keys.clear()
-        self.set_voltages(0.0, 0.0)
+        self.set_voltages(
+            0.0, 0.0, brake=config.KEYBOARD_BRAKE_ON_RELEASE
+        )
 
     def shutdown(self):
         self.clear_input()

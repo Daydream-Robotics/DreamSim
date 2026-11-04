@@ -136,13 +136,28 @@ MOTOR_KV = (
     / NOMINAL_VOLTAGE
 )  # rad/s per V
 
+# What a motor does at exactly 0 V. "coast" lets it freewheel; "brake"
+# shorts it so back-EMF fights the rotation (up to the current limit).
+# robot-core's path follower sets the drive to coast (pathFollower.cpp),
+# but with coast, a keyboard turn at speed (inside side at 0 V) barely
+# turns: nothing slows the inside wheels. So the sim brakes for now.
+# TODO(real robot): confirm how V5 motors behave at move_voltage(0) in
+# each brake mode.
+DRIVE_BRAKE_MODE = "brake"
+if DRIVE_BRAKE_MODE not in ("coast", "brake"):
+    raise RuntimeError("DRIVE_BRAKE_MODE must be 'coast' or 'brake'.")
+
+# Keyboard driving only: brake when every key is released, so letting go
+# stops the robot instead of coasting. Doesn't affect MPC driving.
+KEYBOARD_BRAKE_ON_RELEASE = True
+
 # Sim-only settings.
 CONTROLLABLE_ATTR = "dreamsim:controllable"
 MAX_VOLTAGE = 12.0
 
 # Physics rate. Must fit a whole number of steps into robot-core's control
 # period so each MPC voltage is held for the same length of time.
-PHYSICS_STEPS_PER_SECOND = 200
+PHYSICS_STEPS_PER_SECOND = 100
 STEPS_PER_CONTROL_PERIOD = round(CONTROL_PERIOD * PHYSICS_STEPS_PER_SECOND)
 if not math.isclose(
     STEPS_PER_CONTROL_PERIOD, CONTROL_PERIOD * PHYSICS_STEPS_PER_SECOND
@@ -167,10 +182,21 @@ ROBOT_MASS = 10.0  # kg
 ROBOT_LENGTH = 18.0 * INCH
 ROBOT_WIDTH = 18.0 * INCH
 ROBOT_HEIGHT = 12.0 * INCH
-ROBOT_INERTIA = (
-    ROBOT_MASS * (ROBOT_WIDTH**2 + ROBOT_HEIGHT**2) / 12.0,
-    ROBOT_MASS * (ROBOT_LENGTH**2 + ROBOT_HEIGHT**2) / 12.0,
-    ROBOT_MASS * (ROBOT_LENGTH**2 + ROBOT_WIDTH**2) / 12.0,
+
+# Scales the solid-box inertia to account for where the weight sits: below
+# 1 means mass concentrated toward the centre, so quicker to spin up and to
+# stop spinning.
+# TODO(real robot): approximation tuned by feel. Get the real value from
+# CAD mass properties, a bifilar pendulum test, or by matching the real
+# robot's spin-up time at +/-12 V.
+ROBOT_INERTIA_SCALE = 0.3
+ROBOT_INERTIA = tuple(
+    ROBOT_INERTIA_SCALE * ROBOT_MASS * (a**2 + b**2) / 12.0
+    for a, b in (
+        (ROBOT_WIDTH, ROBOT_HEIGHT),
+        (ROBOT_LENGTH, ROBOT_HEIGHT),
+        (ROBOT_LENGTH, ROBOT_WIDTH),
+    )
 )  # kg*m^2 about x, y, z
 
 # Wheels: evenly spaced along each side, the end wheels WHEEL_EDGE_INSET in
@@ -192,17 +218,33 @@ else:
 # published number (one team's 4" omni on foam tile, direction not stated).
 WHEEL_ROLLING_FRICTION = 0.93
 
-# TODO(real robot): approximation. No published value exists for omni
-# wheels sideways; 0.125 is an estimate from roller rolling resistance on
-# foam tile (plausibly 0.1-0.25). It controls both drift in turns and how
-# freely the robot turns, so calibrate it against the real robot: time a
-# +/-12 V spin in place and measure a fixed-voltage arc (e.g. 12 V / 6 V),
-# then adjust until the sim matches.
+# TODO(real robot): approximation tuned by feel. No published value exists
+# for omni wheels sideways. With all-omni wheels this one value trades
+# sliding against turning: 0.125 (an estimate from roller rolling
+# resistance) let the robot hold its slide angle after turns, while 0.3
+# made the end wheels scrub so much that gentle arcs (12 V / 6 V) barely
+# turned, and 0.2 lost too much forward speed when turning. 0.14 is a
+# compromise. Calibrate against the real robot: time a +/-12 V spin in
+# place, measure a 12 V / 6 V arc, and measure the drift after a turn at
+# full forward, then adjust until the sim matches.
 WHEEL_SIDEWAYS_FRICTION = 0.125
+
+# Rolling resistance and drivetrain drag, as a fraction of each wheel's
+# load. Without it the motors' braking fades as the robot slows, leaving a
+# long slow glide; this brings it to a full stop.
+# TODO(real robot): approximation. Calibrate with a coast-down test: drive
+# at full speed, cut the voltage, and match the stopping distance. The
+# real robot's brake mode matters too: robot-core's path follower sets
+# the drive to coast.
+WHEEL_ROLLING_RESISTANCE = 0.03
 
 # Fraction of each wheel's sideways slip removed per physics step, below
 # the friction limit. Higher grips harder; near 1 or above jitters.
 GRIP_RESPONSE = 0.5
+
+# Beyond this tilt from upright the wheels are treated as off the ground
+# and apply no force, e.g. when the robot is tipped over or on its side.
+MAX_WHEEL_TILT = math.radians(20.0)
 
 # The robot's own collider gets this friction so it glides on the field
 # and all grip comes from the wheel forces.
@@ -212,6 +254,11 @@ ROBOT_COLLIDER_FRICTION = 0.0
 # assumes the centre of mass is there, and they ignore force height. When
 # the real robot model arrives, sum them about its actual centre of mass
 # (see the TODO in drive_controller.py's on_physics_step).
+
+# Seconds of sim time between status lines in the Console while the robot
+# is moving. A line is also printed on the step where the voltages change.
+# 0 turns them off.
+STATUS_INTERVAL = 0.05
 
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60
