@@ -29,10 +29,7 @@ import omni.kit.app
 import omni.timeline
 import omni.usd
 from isaacsim.core.experimental.prims import RigidPrim
-from isaacsim.core.simulation_manager import 
-    SimulationEvent,
-    SimulationManager,
-)
+from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
 from pxr import PhysxSchema, UsdGeom, UsdPhysics
 
 
@@ -233,6 +230,11 @@ class DriveController:
             right_force = side_force(self.v_right, right_speed)
 
             # Two side forces equal one net force plus a yaw torque.
+            # TODO(real robot): this assumes the centre of mass sits midway
+            # between the wheels and ignores force height. When the real
+            # robot model replaces the cube, apply each side's force at its
+            # wheel contact point (apply_forces_and_torques_at_pos's
+            # positions) so an off-centre mass and pitching show up.
             forces[i][0] = left_force + right_force
             torques[i][2] = (right_force - left_force) * half_track
 

@@ -145,5 +145,9 @@ LINEAR_DAMPING = 0.0
 ANGULAR_DAMPING = 0.05
 DEFAULT_MASS = 5.0  # kg, used when the prim has no mass authored
 
+# TODO(real robot): when the robot model replaces the cube, set its real
+# mass and switch drive_controller.py's on_physics_step to apply each
+# side's force at its wheel contact point (see the TODO there).
+
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60
