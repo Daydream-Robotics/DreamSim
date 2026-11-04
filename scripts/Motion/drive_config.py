@@ -140,14 +140,78 @@ MOTOR_KV = (
 CONTROLLABLE_ATTR = "dreamsim:controllable"
 MAX_VOLTAGE = 12.0
 
+# Physics rate. Must fit a whole number of steps into robot-core's control
+# period so each MPC voltage is held for the same length of time.
+PHYSICS_STEPS_PER_SECOND = 200
+STEPS_PER_CONTROL_PERIOD = round(CONTROL_PERIOD * PHYSICS_STEPS_PER_SECOND)
+if not math.isclose(
+    STEPS_PER_CONTROL_PERIOD, CONTROL_PERIOD * PHYSICS_STEPS_PER_SECOND
+):
+    raise RuntimeError(
+        f"PHYSICS_STEPS_PER_SECOND ({PHYSICS_STEPS_PER_SECOND}) must fit a "
+        f"whole number of steps into robot-core's {CONTROL_PERIOD} s "
+        "control period."
+    )
+
 # Kept low: the motor's back-EMF already slows the robot.
 LINEAR_DAMPING = 0.0
 ANGULAR_DAMPING = 0.05
-DEFAULT_MASS = 5.0  # kg, used when the prim has no mass authored
 
-# TODO(real robot): when the robot model replaces the cube, set its real
-# mass and switch drive_controller.py's on_physics_step to apply each
-# side's force at its wheel contact point (see the TODO there).
+GRAVITY = 9.81  # m/s^2
+
+# Robot body. Mass and inertia are applied on every load and override
+# anything saved in the scene. Inertia is a solid box of this size, so the
+# robot turns like a robot even while the placeholder cube is smaller.
+# TODO(real robot): confirm by weighing and measuring the robot.
+ROBOT_MASS = 10.0  # kg
+ROBOT_LENGTH = 18.0 * INCH
+ROBOT_WIDTH = 18.0 * INCH
+ROBOT_HEIGHT = 12.0 * INCH
+ROBOT_INERTIA = (
+    ROBOT_MASS * (ROBOT_WIDTH**2 + ROBOT_HEIGHT**2) / 12.0,
+    ROBOT_MASS * (ROBOT_LENGTH**2 + ROBOT_HEIGHT**2) / 12.0,
+    ROBOT_MASS * (ROBOT_LENGTH**2 + ROBOT_WIDTH**2) / 12.0,
+)  # kg*m^2 about x, y, z
+
+# Wheels: evenly spaced along each side, the end wheels WHEEL_EDGE_INSET in
+# from the front and back edges. Sides sit at +/-TRACK_WIDTH/2.
+# TODO(real robot): confirm count and positions.
+WHEELS_PER_SIDE = 3
+WHEEL_EDGE_INSET = 1.0 * INCH
+_end_wheel_x = ROBOT_LENGTH / 2.0 - WHEEL_EDGE_INSET
+if WHEELS_PER_SIDE == 1:
+    WHEEL_X_POSITIONS = [0.0]
+else:
+    _spacing = 2.0 * _end_wheel_x / (WHEELS_PER_SIDE - 1)
+    WHEEL_X_POSITIONS = [
+        -_end_wheel_x + _spacing * i for i in range(WHEELS_PER_SIDE)
+    ]  # m, forward of centre
+
+# All wheels are omni.
+# TODO(real robot): measure rolling with the tile tilt test. It's the only
+# published number (one team's 4" omni on foam tile, direction not stated).
+WHEEL_ROLLING_FRICTION = 0.93
+
+# TODO(real robot): approximation. No published value exists for omni
+# wheels sideways; 0.125 is an estimate from roller rolling resistance on
+# foam tile (plausibly 0.1-0.25). It controls both drift in turns and how
+# freely the robot turns, so calibrate it against the real robot: time a
+# +/-12 V spin in place and measure a fixed-voltage arc (e.g. 12 V / 6 V),
+# then adjust until the sim matches.
+WHEEL_SIDEWAYS_FRICTION = 0.125
+
+# Fraction of each wheel's sideways slip removed per physics step, below
+# the friction limit. Higher grips harder; near 1 or above jitters.
+GRIP_RESPONSE = 0.5
+
+# The robot's own collider gets this friction so it glides on the field
+# and all grip comes from the wheel forces.
+ROBOT_COLLIDER_FRICTION = 0.0
+
+# TODO(real robot): wheel forces are summed about the body origin, which
+# assumes the centre of mass is there, and they ignore force height. When
+# the real robot model arrives, sum them about its actual centre of mass
+# (see the TODO in drive_controller.py's on_physics_step).
 
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60

@@ -10,7 +10,10 @@ the Property panel, tick it, then save the stage.
 Controls: W/S drive, A/D turn, Space clears all input. The keys are mixed
 into left/right side voltages, the same inputs robot-core's MPC produces.
 Each physics step, every side's voltage and wheel speed go through a V5
-motor model to get that side's wheel force.
+motor model to get that side's drive force, shared across its wheels.
+Each wheel also resists sliding sideways, up to its friction limit. The
+robot's own collider has almost no friction, so all grip comes from the
+wheels.
 
 Settings live in drive_config.py next to this file, which reads the
 robot's values from robot-core. Edits to either take effect on re-run.
@@ -30,7 +33,7 @@ import omni.timeline
 import omni.usd
 from isaacsim.core.experimental.prims import RigidPrim
 from isaacsim.core.simulation_manager import SimulationEvent, SimulationManager
-from pxr import PhysxSchema, UsdGeom, UsdPhysics
+from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics, UsdShade
 
 
 def find_motion_dir():
@@ -93,12 +96,69 @@ def setup_rigid_body(prim):
         )
 
     mass_api = UsdPhysics.MassAPI.Apply(prim)
-    if not mass_api.GetMassAttr().HasAuthoredValueOpinion():
-        mass_api.CreateMassAttr().Set(config.DEFAULT_MASS)
+    mass_api.CreateMassAttr().Set(config.ROBOT_MASS)
+    mass_api.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(*config.ROBOT_INERTIA))
 
     physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     physx_body.CreateLinearDampingAttr().Set(config.LINEAR_DAMPING)
     physx_body.CreateAngularDampingAttr().Set(config.ANGULAR_DAMPING)
+
+
+def setup_robot_material(stage, prims):
+    """Bind a low-friction physics material to the robots' colliders."""
+    root = stage.GetDefaultPrim()
+    root_path = root.GetPath() if root else Sdf.Path.absoluteRootPath
+    material = UsdShade.Material.Define(
+        stage, root_path.AppendChild("RobotPhysicsMaterial")
+    )
+
+    material_api = UsdPhysics.MaterialAPI.Apply(material.GetPrim())
+    material_api.CreateStaticFrictionAttr().Set(config.ROBOT_COLLIDER_FRICTION)
+    material_api.CreateDynamicFrictionAttr().Set(
+        config.ROBOT_COLLIDER_FRICTION
+    )
+    material_api.CreateRestitutionAttr().Set(0.0)
+
+    # PhysX averages two surfaces' friction by default, which would bring
+    # the field's friction back in. "min" wins over "average".
+    physx_material = PhysxSchema.PhysxMaterialAPI.Apply(material.GetPrim())
+    physx_material.CreateFrictionCombineModeAttr().Set("min")
+
+    for prim in prims:
+        binding = UsdShade.MaterialBindingAPI.Apply(prim)
+        binding.Bind(
+            material, UsdShade.Tokens.weakerThanDescendants, "physics"
+        )
+
+
+def check_stage_units(stage):
+    """Return an error message if the stage isn't metres, kg and Z-up."""
+    # The motor model works in newtons and the yaw maths assumes Z-up.
+    # Changing a stage's units would rescale everything else in it, so
+    # refuse to run instead.
+    meters_per_unit = UsdGeom.GetStageMetersPerUnit(stage)
+    kilograms_per_unit = UsdPhysics.GetStageKilogramsPerUnit(stage)
+    up_axis = UsdGeom.GetStageUpAxis(stage)
+    if meters_per_unit != 1.0 or kilograms_per_unit != 1.0:
+        return (
+            f"stage units are {meters_per_unit} m and {kilograms_per_unit} "
+            "kg per unit; the drive model needs 1.0 for both."
+        )
+    if up_axis != UsdGeom.Tokens.z:
+        return f"stage up axis is {up_axis}; the drive model needs Z."
+    return None
+
+
+def setup_physics_scenes(stage):
+    """Set every physics scene's rate to config.PHYSICS_STEPS_PER_SECOND."""
+    scenes = [prim for prim in stage.Traverse() if prim.IsA(UsdPhysics.Scene)]
+    if not scenes:
+        scenes = [UsdPhysics.Scene.Define(stage, "/PhysicsScene").GetPrim()]
+    for scene in scenes:
+        physx_scene = PhysxSchema.PhysxSceneAPI.Apply(scene)
+        physx_scene.CreateTimeStepsPerSecondAttr().Set(
+            config.PHYSICS_STEPS_PER_SECOND
+        )
 
 
 def arcade_to_tank(drive, steer):
@@ -111,11 +171,16 @@ def arcade_to_tank(drive, steer):
     return max_voltage * left / scale, max_voltage * right / scale
 
 
+def clamp(value, limit):
+    """Limit value to the range [-limit, limit]."""
+    return max(-limit, min(limit, value))
+
+
 def motor_torque(voltage, motor_speed):
     """Output torque of one motor from its voltage and speed (rad/s)."""
     back_emf = motor_speed / config.MOTOR_KV
     current = (voltage - back_emf) / config.MOTOR_RESISTANCE
-    current = max(-config.CURRENT_LIMIT, min(config.CURRENT_LIMIT, current))
+    current = clamp(current, config.CURRENT_LIMIT)
     return config.MOTOR_KT * current
 
 
@@ -126,6 +191,41 @@ def side_force(voltage, ground_speed):
     torque = motor_torque(voltage, motor_speed)
     wheel_torque = config.MOTORS_PER_SIDE * torque / config.DRIVE_GEAR_RATIO
     return wheel_torque / config.WHEEL_RADIUS
+
+
+def drive_wrench(v_left, v_right, forward_speed, sideways_speed, yaw_rate,
+                 dt):
+    """Net body-frame force (x, y) and yaw torque from all the wheels.
+
+    Speeds are in the robot's frame: x forward, y left, z up.
+    """
+    wheel_count = 2 * config.WHEELS_PER_SIDE
+    normal_force = config.ROBOT_MASS * config.GRAVITY / wheel_count
+    rolling_limit = config.WHEEL_ROLLING_FRICTION * normal_force
+    sideways_limit = config.WHEEL_SIDEWAYS_FRICTION * normal_force
+    # Sideways force per m/s of slip that removes GRIP_RESPONSE of a
+    # wheel's slip in one step.
+    grip_gain = config.GRIP_RESPONSE * config.ROBOT_MASS / wheel_count / dt
+
+    force_x = 0.0
+    force_y = 0.0
+    torque_z = 0.0
+    half_track = config.TRACK_WIDTH / 2.0
+    for side_y, voltage in ((half_track, v_left), (-half_track, v_right)):
+        side_speed = forward_speed - yaw_rate * side_y
+        per_wheel = side_force(voltage, side_speed) / config.WHEELS_PER_SIDE
+        # Beyond the friction limit the wheel spins instead of pushing.
+        drive = clamp(per_wheel, rolling_limit)
+
+        for wheel_x in config.WHEEL_X_POSITIONS:
+            slip = sideways_speed + yaw_rate * wheel_x
+            grip = clamp(-grip_gain * slip, sideways_limit)
+
+            force_x += drive
+            force_y += grip
+            torque_z += wheel_x * grip - side_y * drive
+
+    return force_x, force_y, torque_z
 
 
 def quaternion_to_yaw(quaternion):
@@ -158,6 +258,7 @@ class DriveController:
 
         for prim in self.prims:
             setup_rigid_body(prim)
+        setup_robot_material(omni.usd.get_context().get_stage(), self.prims)
         self.robots = RigidPrim([str(prim.GetPath()) for prim in self.prims])
 
         self.physics_callback = SimulationManager.register_callback(
@@ -188,6 +289,11 @@ class DriveController:
             f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
             f"{model_speed:.1f} rad/s, robot-core {robot_speed:.1f} rad/s"
         )
+        print(
+            f"Physics: {config.PHYSICS_STEPS_PER_SECOND} steps/s, "
+            f"{config.STEPS_PER_CONTROL_PERIOD} per "
+            f"{config.CONTROL_PERIOD * 1000:.0f} ms control period"
+        )
 
     def update_voltages(self):
         key = carb.input.KeyboardInput
@@ -199,12 +305,12 @@ class DriveController:
 
     def set_voltages(self, v_left, v_right):
         """Set the side voltages, clamped to +/-config.MAX_VOLTAGE."""
-        max_voltage = config.MAX_VOLTAGE
-        self.v_left = max(-max_voltage, min(max_voltage, v_left))
-        self.v_right = max(-max_voltage, min(max_voltage, v_right))
+        self.v_left = clamp(v_left, config.MAX_VOLTAGE)
+        self.v_right = clamp(v_right, config.MAX_VOLTAGE)
 
     def on_physics_step(self, dt, context):
-        if not self.robots.is_physics_tensor_entity_valid():
+        # drive_wrench divides by dt, so skip zero-length steps.
+        if dt <= 0.0 or not self.robots.is_physics_tensor_entity_valid():
             return
 
         _, orientations = self.robots.get_world_poses()
@@ -217,26 +323,28 @@ class DriveController:
         torques = np.zeros((len(self.prims), 3), dtype=np.float32)
         for i in range(len(self.prims)):
             yaw = quaternion_to_yaw(orientations[i])
+            velocity_x, velocity_y = linear_velocities[i][:2]
             forward_speed = (
-                linear_velocities[i][0] * math.cos(yaw)
-                + linear_velocities[i][1] * math.sin(yaw)
+                velocity_x * math.cos(yaw) + velocity_y * math.sin(yaw)
+            )
+            sideways_speed = (
+                -velocity_x * math.sin(yaw) + velocity_y * math.cos(yaw)
             )
             yaw_rate = angular_velocities[i][2]
 
-            half_track = config.TRACK_WIDTH / 2.0
-            left_speed = forward_speed - yaw_rate * half_track
-            right_speed = forward_speed + yaw_rate * half_track
-            left_force = side_force(self.v_left, left_speed)
-            right_force = side_force(self.v_right, right_speed)
-
-            # Two side forces equal one net force plus a yaw torque.
-            # TODO(real robot): this assumes the centre of mass sits midway
-            # between the wheels and ignores force height. When the real
-            # robot model replaces the cube, apply each side's force at its
-            # wheel contact point (apply_forces_and_torques_at_pos's
+            # TODO(real robot): the wheel forces are summed about the body
+            # origin, which assumes the centre of mass is there, and they
+            # ignore force height. When the real robot model replaces the
+            # cube, sum them about its actual centre of mass (or apply each
+            # at its contact point with apply_forces_and_torques_at_pos's
             # positions) so an off-centre mass and pitching show up.
-            forces[i][0] = left_force + right_force
-            torques[i][2] = (right_force - left_force) * half_track
+            force_x, force_y, torque_z = drive_wrench(
+                self.v_left, self.v_right,
+                forward_speed, sideways_speed, yaw_rate, dt,
+            )
+            forces[i][0] = force_x
+            forces[i][1] = force_y
+            torques[i][2] = torque_z
 
         self.robots.apply_forces_and_torques_at_pos(
             forces=forces, torques=torques, local_frame=True
@@ -317,6 +425,11 @@ async def load_tank_controls():
         )
         return
 
+    units_error = check_stage_units(stage)
+    if units_error is not None:
+        carb.log_error(f"Drive controller not loaded: {units_error}")
+        return
+
     # Request Stop and let Isaac Sim process the state change.
     timeline.stop()
     await app.next_update_async()
@@ -333,6 +446,8 @@ async def load_tank_controls():
     # Exceptions raised inside this task are not shown in the Script
     # Editor, so log them explicitly.
     try:
+        # The physics rate can only change while stopped.
+        setup_physics_scenes(stage)
         _tank_controller = DriveController(prims)
     except Exception as error:
         carb.log_error(f"Drive controller failed to load: {error}")
