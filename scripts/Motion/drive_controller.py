@@ -102,6 +102,11 @@ def setup_rigid_body(prim):
     physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     physx_body.CreateLinearDampingAttr().Set(config.LINEAR_DAMPING)
     physx_body.CreateAngularDampingAttr().Set(config.ANGULAR_DAMPING)
+    # Never sleep. PhysX puts slow bodies to sleep (default threshold 5e-5,
+    # which a robot creeping at a few deg/s is under). A sleeping body stops
+    # being simulated, and its velocity reads back stale: the robot showed a
+    # constant turn rate at 0 V that the wheel model could never damp out.
+    physx_body.CreateSleepThresholdAttr().Set(0.0)
 
 
 def setup_robot_material(stage, prims):

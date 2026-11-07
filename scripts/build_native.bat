@@ -32,4 +32,4 @@ if /i not "%VSCMD_ARG_TGT_ARCH%"=="x64" (
 uv run cmake -S native -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
 uv run cmake --build build %1 %2 %3 %4 %5 || exit /b 1
 echo.
-echo Built: build\als_dump.exe, build\robotcore\robotcore_mpc.lib
+echo Built: build\als_dump.exe, build\mpc_bridge.dll, build\robotcore\robotcore_mpc.lib
