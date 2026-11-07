@@ -14,6 +14,7 @@
 #include "motion/pathing/paths.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -29,6 +30,8 @@
 enum BridgeStatus {
     BRIDGE_RUNNING = 0,
     BRIDGE_FINISHED = 1,
+    // still following, but the solve failed so the voltages are 0 V (robot-core's failsafe)
+    BRIDGE_SOLVE_FAILED = 2,
     BRIDGE_ERROR = -1,
 };
 
@@ -83,19 +86,21 @@ BRIDGE_API int mpc_bridge_set_path(Bridge* bridge, int index) {
     return 0;
 }
 
-// One control step (PathFollower::step). Writes the drive voltages (V) and the distance left
-// along the path (in). Returns BRIDGE_RUNNING, BRIDGE_FINISHED (stop the drive) or
-// BRIDGE_ERROR (no path set).
+// One control step (PathFollower::step). Writes the drive voltages (V), the distance left
+// along the path (in), and how far the measured pose is from the closest path sample (in).
+// Returns BRIDGE_RUNNING, BRIDGE_SOLVE_FAILED (0 V this step), BRIDGE_FINISHED (stop the
+// drive) or BRIDGE_ERROR (no path set).
 //
 // omegaLeft/omegaRight are the measured wheel speeds and age is how old they are (s). The MPC
 // predicts the robot forward by that age plus MPC_COMMAND_DELAY, so the caller must apply the
 // returned voltages MPC_COMMAND_DELAY after this call.
 BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
                                double omegaLeft, double omegaRight, double batteryVolts, double age,
-                               double* vLeft, double* vRight, double* distanceLeft) {
+                               double* vLeft, double* vRight, double* distanceLeft, double* offPath) {
     *vLeft = 0.0;
     *vRight = 0.0;
     *distanceLeft = 0.0;
+    *offPath = 0.0;
     if (!bridge->path) {
         return BRIDGE_ERROR;
     }
@@ -124,7 +129,9 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
         return BRIDGE_FINISHED;
     }
 
-    *distanceLeft = path.getTotalLength() - samples[bridge->currentSampleIdx].s;
+    const Sample& closest = samples[bridge->currentSampleIdx];
+    *distanceLeft = path.getTotalLength() - closest.s;
+    *offPath = std::hypot(x - closest.x, y - closest.y);
     if (*distanceLeft < END_TOLERANCE) {
         bridge->finished = true;
         return BRIDGE_FINISHED;
@@ -138,5 +145,9 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
     }
     *vLeft = out.left / 1000.0;
     *vRight = out.right / 1000.0;
+    // a failed solve returns exactly 0 V on both sides; a real solve practically never does
+    if (out.left == 0.0 && out.right == 0.0) {
+        return BRIDGE_SOLVE_FAILED;
+    }
     return BRIDGE_RUNNING;
 }

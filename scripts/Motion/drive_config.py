@@ -274,5 +274,18 @@ ROBOT_COLLIDER_FRICTION = 0.0
 # 0 turns them off.
 STATUS_INTERVAL = 0.05
 
+# Autonomous (P key in drive_controller.py, and test_mpc_bridge.py): the
+# JerryIO file whose paths robot-core's MPC follows, in order.
+MPC_PATH_FILE = (
+    ROBOT_CORE / "common-utils" / "paths" / "unit_tests" / "auton"
+    / "auton.path.jerryio.txt"
+)
+# Battery voltage reported to the MPC. The motor model has no sag, so this
+# matches the 12 V it drives with.
+MPC_BATTERY_VOLTS = 12.0
+# Give up on a path that hasn't finished after this long (s). robot-core has
+# no limit, but a robot stuck in the sim would otherwise run forever.
+MPC_PATH_TIMEOUT = 15.0
+
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60

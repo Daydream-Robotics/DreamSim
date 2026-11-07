@@ -12,11 +12,15 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LIBRARY_NAME = "mpc_bridge.dll" if sys.platform == "win32" else "libmpc_bridge.so"
+LIBRARY_NAME = (
+    "mpc_bridge.dll" if sys.platform == "win32" else "libmpc_bridge.so"
+)
 LIBRARY_PATH = REPO_ROOT / "build" / LIBRARY_NAME
 
 RUNNING = 0
 FINISHED = 1
+# Still following, but the solve failed so the voltages are 0 V.
+SOLVE_FAILED = 2
 ERROR = -1
 
 _double_p = ctypes.POINTER(ctypes.c_double)
@@ -25,7 +29,8 @@ _double_p = ctypes.POINTER(ctypes.c_double)
 def _load_library():
     if not LIBRARY_PATH.is_file():
         raise RuntimeError(
-            f"{LIBRARY_PATH} not found. Build it with: scripts\\build_native.bat"
+            f"{LIBRARY_PATH} not found. Build it with: "
+            "scripts\\build_native.bat"
         )
     library = ctypes.CDLL(str(LIBRARY_PATH))
 
@@ -35,12 +40,14 @@ def _load_library():
     library.mpc_bridge_destroy.restype = None
     library.mpc_bridge_path_count.argtypes = [ctypes.c_void_p]
     library.mpc_bridge_path_count.restype = ctypes.c_int
-    library.mpc_bridge_start_pose.argtypes = [ctypes.c_void_p] + [_double_p] * 3
+    library.mpc_bridge_start_pose.argtypes = (
+        [ctypes.c_void_p] + [_double_p] * 3
+    )
     library.mpc_bridge_start_pose.restype = None
     library.mpc_bridge_set_path.argtypes = [ctypes.c_void_p, ctypes.c_int]
     library.mpc_bridge_set_path.restype = ctypes.c_int
     library.mpc_bridge_step.argtypes = (
-        [ctypes.c_void_p] + [ctypes.c_double] * 7 + [_double_p] * 3
+        [ctypes.c_void_p] + [ctypes.c_double] * 7 + [_double_p] * 4
     )
     library.mpc_bridge_step.restype = ctypes.c_int
     return library
@@ -86,16 +93,20 @@ class MpcBridge:
              age=0.0):
         """Run one control step.
 
-        Returns (status, v_left, v_right, distance_left) with voltages in V
-        and distance in inches. Apply the voltages robot-core's
+        Returns (status, v_left, v_right, distance_left, off_path): voltages
+        in V; distance left along the path and distance from the closest
+        path point in inches. Apply the voltages robot-core's
         MPC_COMMAND_DELAY after this call: the MPC plans for that.
         """
         v_left, v_right = ctypes.c_double(), ctypes.c_double()
-        distance_left = ctypes.c_double()
+        distance_left, off_path = ctypes.c_double(), ctypes.c_double()
         status = self._library.mpc_bridge_step(
             self._handle, x, y, theta, omega_left, omega_right,
             battery_volts, age,
             ctypes.byref(v_left), ctypes.byref(v_right),
-            ctypes.byref(distance_left),
+            ctypes.byref(distance_left), ctypes.byref(off_path),
         )
-        return status, v_left.value, v_right.value, distance_left.value
+        return (
+            status, v_left.value, v_right.value, distance_left.value,
+            off_path.value,
+        )
