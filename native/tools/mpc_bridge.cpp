@@ -12,6 +12,7 @@
 #include "config/constants.h"
 #include "motion/control/mpc.hpp"
 #include "motion/pathing/paths.hpp"
+#include "utils/mathHelpers.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -71,6 +72,100 @@ BRIDGE_API void mpc_bridge_start_pose(const Bridge* bridge, double* x, double* y
     *x = bridge->startPose.x;
     *y = bridge->startPose.y;
     *theta = bridge->startPose.theta;
+}
+
+// Number of spline samples in a path, or -1 for a bad index.
+BRIDGE_API int mpc_bridge_sample_count(const Bridge* bridge, int index) {
+    if (index < 0 || index >= static_cast<int>(bridge->paths.size())) {
+        return BRIDGE_ERROR;
+    }
+    return static_cast<int>(bridge->paths[index].getSamples().size());
+}
+
+// Copies up to capacity of a path's spline samples (x, y in inches, v in the file's speed
+// units): the exact points the MPC follows, for drawing. Returns the number copied, or -1.
+BRIDGE_API int mpc_bridge_samples(const Bridge* bridge, int index, double* x, double* y,
+                                  double* v, int capacity) {
+    if (index < 0 || index >= static_cast<int>(bridge->paths.size())) {
+        return BRIDGE_ERROR;
+    }
+    const std::vector<Sample>& samples = bridge->paths[index].getSamples();
+    const int count = std::min(capacity, static_cast<int>(samples.size()));
+    for (int i = 0; i < count; i++) {
+        x[i] = samples[i].x;
+        y[i] = samples[i].y;
+        v[i] = samples[i].v;
+    }
+    return count;
+}
+
+// Curvature speed cap at arc length sq. Copy of capAt in robot-core's
+// jetson-nano/src/motion/control/mpcReference.cpp: keep in sync.
+static double referenceCapAt(const ALS_Path& path, double sq, double sEnd, double vStraightMax) {
+    InterpSample a = path.sampleAtArcLength(sq);
+    InterpSample b = path.sampleAtArcLength(std::min(sq + 3.0, sEnd));
+    double ds = std::max(1e-3, b.s - a.s);
+    double kappa = std::abs(utils::wrapAngle(b.theta - a.theta)) / ds;
+    return vStraightMax / (1.0 + kappa * TRACK_WIDTH / 2.0);
+}
+
+// Braking-aware cap. Copy of brakingCapAt in mpcReference.cpp: keep in sync.
+static double referenceBrakingCapAt(const ALS_Path& path, double sq, double vNow, double sEnd, double vStraightMax) {
+    double cap = referenceCapAt(path, sq, sEnd, vStraightMax);
+    double brakeDist = (vNow * vNow) / (2.0 * MPC_A_MAX) + 2.0;
+    for (double d = 2.0; d <= brakeDist; d += 2.0) {
+        double sAhead = sq + d;
+        if (sAhead >= sEnd) {
+            break;
+        }
+        double c = referenceCapAt(path, sAhead, sEnd, vStraightMax);
+        cap = std::min(cap, std::sqrt(c * c + 2.0 * MPC_A_MAX * d));
+    }
+    double dEnd = std::max(0.0, sEnd - sq);
+    return std::min(cap, std::sqrt(2.0 * MPC_A_MAX * dEnd));
+}
+
+// The speed (in/s) robot-core's MPC reference targets at each of a path's spline samples:
+// its speed profile stepped along the whole path from rest at the MPC period, as if the robot
+// tracked it perfectly (same steps as MPCReference::build). Writes up to capacity values.
+// Returns the number written, or -1 for a bad index.
+BRIDGE_API int mpc_bridge_reference_speeds(const Bridge* bridge, int index, double* speeds, int capacity) {
+    if (index < 0 || index >= static_cast<int>(bridge->paths.size())) {
+        return BRIDGE_ERROR;
+    }
+    const ALS_Path& path = bridge->paths[index];
+    const std::vector<Sample>& samples = path.getSamples();
+    const double sEnd = samples.back().s;
+    const double h = MPC_SAMPLE_PERIOD;
+    const double r = DRIVE_WHEEL_DIAMETER_INCHES / 2.0;
+    const double vStraightMax = 0.9 * (MPC_MOTOR_B / MPC_MOTOR_A) * 12.0 * r;
+
+    // (arc length, speed from there) at each reference step
+    std::vector<std::pair<double, double>> profile;
+    double s = 0.0;
+    double v = MPC_V_REF_MIN;
+    while (profile.size() < 1000000) {
+        double vFloor = (sEnd - s < 6.0) ? 1.0 : MPC_V_REF_MIN;
+        double vCap = referenceBrakingCapAt(path, s, v, sEnd, vStraightMax);
+        double vTarget = std::min(vCap, v + MPC_A_MAX * h);
+        v = std::max({vTarget, v - MPC_A_MAX * h, vFloor});
+        profile.emplace_back(s, v);
+        s += v * h;
+        if (s >= sEnd) {
+            break;
+        }
+    }
+
+    // read the profile at each sample's arc length
+    const int count = std::min(capacity, static_cast<int>(samples.size()));
+    std::size_t step = 0;
+    for (int i = 0; i < count; i++) {
+        while (step + 1 < profile.size() && profile[step + 1].first <= samples[i].s) {
+            step++;
+        }
+        speeds[i] = profile[step].second;
+    }
+    return count;
 }
 
 // Starts following a path (PathFollower::setPath). Returns 0, or -1 for a bad index.

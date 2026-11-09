@@ -74,6 +74,7 @@ import autonomous  # noqa: E402
 import drivetrain_config as config  # noqa: E402
 import drivetrain_model as model  # noqa: E402
 import mpc_bridge  # noqa: E402
+import path_display  # noqa: E402
 
 # Reload so edits to these files or robot-core apply without a restart.
 # Config first: the others read it when they load.
@@ -81,6 +82,7 @@ config = importlib.reload(config)
 mpc_bridge = importlib.reload(mpc_bridge)
 model = importlib.reload(model)
 autonomous = importlib.reload(autonomous)
+path_display = importlib.reload(path_display)
 
 
 def find_robot_prims(stage):
@@ -120,6 +122,10 @@ def setup_rigid_body(prim):
     # being simulated, and its velocity reads back stale: the robot showed a
     # constant turn rate at 0 V that the wheel model could never damp out.
     physx_body.CreateSleepThresholdAttr().Set(0.0)
+    # Likewise no stabilization, which also treats slow bodies as resting.
+    # With it on, the robot sat still while PhysX reported a constant
+    # -4 deg/s turn (the heading didn't change over 5 s).
+    physx_body.CreateStabilizationThresholdAttr().Set(0.0)
 
 
 def setup_robot_material(stage, prims):
@@ -204,6 +210,7 @@ class DriveController:
         self.keyboard_subscription = None
         self.timeline_subscription = None
         self.physics_callback = None
+        self.output_file = None
         self.prims = prims
         self.v_left = 0.0
         self.v_right = 0.0
@@ -212,7 +219,7 @@ class DriveController:
         self.voltages_changed = False
         self.rate_checked = False
         self.autonomous = None
-        self.autonomous_requested = False
+        self.pending_autonomous = None
 
         self.timeline = omni.timeline.get_timeline_interface()
 
@@ -240,8 +247,14 @@ class DriveController:
             self.on_timeline_event
         )
 
+        # Position and path output goes to a file, overwritten each run.
+        self.output_file = open(
+            config.OUTPUT_FILE, "w", encoding="utf-8", buffering=1
+        )
+
         paths = ", ".join(str(prim.GetPath()) for prim in self.prims)
         print(f"Tank controller loaded for: {paths}")
+        print(f"Position and path output: {config.OUTPUT_FILE}")
 
         # Compare the motor model with the robot's identified model.
         model_speed = (
@@ -301,9 +314,10 @@ class DriveController:
 
         # The robot is moved to the path start here, between physics steps,
         # and the MPC takes over from the next step.
-        if self.autonomous_requested:
-            self.autonomous_requested = False
-            self.start_autonomous(positions[0])
+        if self.pending_autonomous is not None:
+            run = self.pending_autonomous
+            self.pending_autonomous = None
+            self.start_autonomous(run, positions[0])
             return
 
         # Print on a fixed interval, and on the step a key press or release
@@ -335,8 +349,8 @@ class DriveController:
             if tipped:
                 if print_status:
                     self.print_status(
-                        i, forward_speed, sideways_speed, yaw_rate,
-                        tipped=True,
+                        i, positions[i], rotation, forward_speed,
+                        sideways_speed, yaw_rate, tipped=True,
                     )
                 continue
 
@@ -363,21 +377,74 @@ class DriveController:
 
             if print_status:
                 self.print_status(
-                    i, forward_speed, sideways_speed, yaw_rate
+                    i, positions[i], rotation, forward_speed,
+                    sideways_speed, yaw_rate,
                 )
 
         self.robots.apply_forces_and_torques_at_pos(
             forces=forces, torques=torques, local_frame=True
         )
 
-    def start_autonomous(self, current_position):
-        """Load the path file and move the first robot to its start pose."""
+    def prepare_autonomous(self):
+        """Load the path file and draw its paths (P key).
+
+        Runs from the keyboard handler, outside the physics step, so the
+        drawing doesn't change the stage mid-step. The next physics step
+        places the robot and starts driving.
+        """
         self.cancel_autonomous()
+        self.discard_pending_autonomous()
         try:
-            self.autonomous = autonomous.Autonomous(config.MPC_PATH_FILE)
+            run = autonomous.Autonomous(config.MPC_PATH_FILE, log=self.output)
         except Exception as error:
             carb.log_error(f"Autonomous not started: {error}")
             return
+
+        if config.SHOW_MPC_PATHS:
+            try:
+                self.draw_paths(run.bridge)
+            except Exception as error:
+                carb.log_warn(f"Couldn't draw the path: {error}")
+
+        self.pending_autonomous = run
+
+    def draw_paths(self, bridge):
+        """Draw the bridge's paths, coloured per config.PATH_DISPLAY_SPEED."""
+        paths = []
+        for i in range(bridge.path_count):
+            samples = bridge.samples(i)
+            if config.PATH_DISPLAY_SPEED == "reference":
+                speeds = bridge.reference_speeds(i)
+                samples = [
+                    (x, y, speed) for (x, y, _), speed in zip(samples, speeds)
+                ]
+            paths.append(samples)
+
+        v_min, v_max = path_display.draw_paths(
+            omni.usd.get_context().get_stage(), paths,
+            height=config.PATH_DISPLAY_HEIGHT,
+            width=config.PATH_DISPLAY_WIDTH,
+            session=True,
+        )
+        if config.PATH_DISPLAY_SPEED == "reference":
+            self.output(
+                f"Path coloured by MPC reference speed: {v_min:.1f} in/s "
+                f"(red) to {v_max:.1f} in/s (green)"
+            )
+        else:
+            self.output(
+                f"Path coloured by the file's speeds: {v_min:.1f} (red) to "
+                f"{v_max:.1f} (green)"
+            )
+
+    def discard_pending_autonomous(self):
+        if self.pending_autonomous is not None:
+            self.pending_autonomous.close()
+            self.pending_autonomous = None
+
+    def start_autonomous(self, run, current_position):
+        """Move the first robot to the run's start pose and start it."""
+        self.autonomous = run
 
         x, y, heading = self.autonomous.start_pose()
         yaw = model.yaw_from_heading(heading)
@@ -396,17 +463,17 @@ class DriveController:
         self.keys.clear()
         self.set_voltages(0.0, 0.0, brake=True)
 
-        print(
+        self.output(
             f"Autonomous: {self.autonomous.bridge.path_count} paths from "
             f"{config.MPC_PATH_FILE}"
         )
-        print(
+        self.output(
             f"Robot placed at ({x:.1f}, {y:.1f}) in, heading "
             f"{math.degrees(heading):.0f} deg. Drive keys or Space take "
             "back control."
         )
         if len(self.prims) > 1:
-            print(
+            self.output(
                 "Autonomous follows the first robot; the others get the "
                 "same voltages."
             )
@@ -435,7 +502,12 @@ class DriveController:
         self.autonomous = None
         self.set_voltages(0.0, 0.0, brake=True)
         if reason:
-            print(f"Autonomous stopped: {reason}.")
+            self.output(f"Autonomous stopped: {reason}.")
+
+    def output(self, line):
+        """Write a position or path line to config.OUTPUT_FILE."""
+        if self.output_file is not None:
+            self.output_file.write(line + "\n")
 
     def check_physics_rate(self, dt):
         """Report the rate PhysX actually runs at, from the step length."""
@@ -450,9 +522,16 @@ class DriveController:
                 "else is setting the physics rate."
             )
 
-    def print_status(self, index, forward_speed, sideways_speed, yaw_rate,
-                     tipped=False):
-        """Print one robot's motion, skipping robots that aren't moving."""
+    def print_status(self, index, position, rotation, forward_speed,
+                     sideways_speed, yaw_rate, tipped=False):
+        """Write one robot's pose and motion to the output file, skipping
+        robots that aren't moving.
+
+        Position and heading are in robot-core's field frame (inches,
+        heading 0 along +y, clockwise). The heading comes from the pose,
+        not the velocity, so a turn rate that doesn't match a changing
+        heading points at a bad reading.
+        """
         moving = (
             abs(forward_speed) > 0.01
             or abs(sideways_speed) > 0.01
@@ -460,12 +539,17 @@ class DriveController:
         )
         if not moving:
             return
-        print(
+        yaw = math.atan2(rotation[1][0], rotation[0][0])
+        heading = math.degrees(model.heading_from_yaw(yaw))
+        self.output(
             f"{self.prims[index].GetPath()}: "
+            f"x {position[0] / config.INCH:+7.2f} in  "
+            f"y {position[1] / config.INCH:+7.2f} in  "
             f"V {self.v_left:+5.1f}/{self.v_right:+5.1f}  "
             f"forward {forward_speed / config.INCH:+6.1f} in/s  "
             f"sideways {sideways_speed / config.INCH:+6.1f} in/s  "
-            f"turn {math.degrees(yaw_rate):+6.0f} deg/s"
+            f"turn {math.degrees(yaw_rate):+6.0f} deg/s  "
+            f"heading {heading:+7.2f} deg"
             + ("  TIPPED, wheels off" if tipped else "")
         )
 
@@ -477,13 +561,14 @@ class DriveController:
             carb.input.KeyboardEventType.KEY_REPEAT,
         )
 
-        # P starts (or restarts) autonomous on the next physics step.
+        # P starts (or restarts) autonomous: the path is drawn now, the
+        # robot moves on the next physics step.
         if event.input == key.P:
             if (
                 event.type == carb.input.KeyboardEventType.KEY_PRESS
                 and self.timeline.is_playing()
             ):
-                self.autonomous_requested = True
+                self.prepare_autonomous()
             return True
 
         if event.input not in controlled_keys:
@@ -515,7 +600,7 @@ class DriveController:
             int(omni.timeline.TimelineEventType.STOP),
             int(omni.timeline.TimelineEventType.PAUSE),
         ):
-            self.autonomous_requested = False
+            self.discard_pending_autonomous()
             self.cancel_autonomous("the simulation stopped")
             self.clear_input()
 
@@ -526,6 +611,7 @@ class DriveController:
         )
 
     def shutdown(self):
+        self.discard_pending_autonomous()
         self.cancel_autonomous()
         self.clear_input()
 
@@ -540,6 +626,10 @@ class DriveController:
             self.keyboard_subscription = None
 
         self.timeline_subscription = None
+
+        if self.output_file is not None:
+            self.output_file.close()
+            self.output_file = None
 
 
 async def load_tank_controls():

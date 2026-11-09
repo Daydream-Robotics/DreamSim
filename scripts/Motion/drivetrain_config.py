@@ -286,5 +286,21 @@ MPC_BATTERY_VOLTS = 12.0
 # no limit, but a robot stuck in the sim would otherwise run forever.
 MPC_PATH_TIMEOUT = 15.0
 
+# Draw MPC_PATH_FILE's paths on the field when autonomous starts: ribbons
+# coloured by path speed (red slow, green fast), drawn in the stage's
+# session layer so saving the scene doesn't keep them.
+SHOW_MPC_PATHS = True
+PATH_DISPLAY_HEIGHT = 0.02  # m above the floor
+PATH_DISPLAY_WIDTH = 0.02  # m
+# What the colour shows: "reference" is the speed robot-core's MPC reference
+# targets (curvature and acceleration limited, from rest, as if tracked
+# perfectly); "file" is the speed column in the JerryIO file.
+PATH_DISPLAY_SPEED = "reference"
+
+# Robot position and path output (status lines, autonomous placement and
+# per-path results). Overwritten each time the controller loads;
+# gitignored.
+OUTPUT_FILE = REPO_ROOT / "output_latest.txt"
+
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60
