@@ -10,7 +10,7 @@ Poses here are robot-core's: field frame, inches, heading 0 along +y and
 pi/2 along +x (clockwise).
 """
 
-import drive_config as config
+import drivetrain_config as config
 import mpc_bridge
 
 

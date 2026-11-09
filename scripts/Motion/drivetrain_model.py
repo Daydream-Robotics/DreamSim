@@ -1,12 +1,12 @@
 """Drivetrain physics for drive_controller.py, with no Isaac Sim imports.
 
 Kept separate so test_mpc_bridge.py can run the exact same model with plain
-Python. Settings come from drive_config.py.
+Python. Settings come from drivetrain_config.py.
 """
 
 import math
 
-import drive_config as config
+import drivetrain_config as config
 
 
 def clamp(value, limit):

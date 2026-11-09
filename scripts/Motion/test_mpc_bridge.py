@@ -1,8 +1,8 @@
 """Run robot-core's MPC over a JerryIO file without Isaac Sim.
 
-Drives the same autonomous.py and drive_model.py physics as
-drive_controller.py, on a flat 2D rigid body: no PhysX, collisions, walls or
-tipping. A quick check after changing robot-core or the drive model.
+Drives the same autonomous.py and drivetrain_model.py physics as
+drivetrain_controller.py, on a flat 2D rigid body: no PhysX, collisions, walls or
+tipping. A quick check after changing robot-core or the drivetrain model.
 
 usage (from the repo root, after scripts\\build_native.bat):
     python scripts/Motion/test_mpc_bridge.py [path.jerryio.txt ...]
@@ -15,8 +15,8 @@ import sys
 from pathlib import Path
 
 import autonomous
-import drive_config as config
-import drive_model as model
+import drivetrain_config as config
+import drivetrain_model as model
 
 
 def run(path_file):

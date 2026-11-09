@@ -21,7 +21,7 @@ Each wheel also resists sliding sideways, up to its friction limit. The
 robot's own collider has almost no friction, so all grip comes from the
 wheels.
 
-Settings live in drive_config.py next to this file, which reads the
+Settings live in drivetrain_config.py next to this file, which reads the
 robot's values from robot-core. Edits to either take effect on re-run.
 """
 
@@ -58,10 +58,10 @@ def find_motion_dir():
             candidates.append(parent / "scripts" / "Motion")
 
     for candidate in candidates:
-        if (candidate / "drive_config.py").is_file():
+        if (candidate / "drivetrain_config.py").is_file():
             return candidate
     raise RuntimeError(
-        "Couldn't find scripts/Motion/drive_config.py. Open a scene from "
+        "Couldn't find scripts/Motion/drivetrain_config.py. Open a scene from "
         "the DreamSim repo with File > Open, then run this again."
     )
 
@@ -71,8 +71,8 @@ if _motion_dir not in sys.path:
     sys.path.insert(0, _motion_dir)
 
 import autonomous  # noqa: E402
-import drive_config as config  # noqa: E402
-import drive_model as model  # noqa: E402
+import drivetrain_config as config  # noqa: E402
+import drivetrain_model as model  # noqa: E402
 import mpc_bridge  # noqa: E402
 
 # Reload so edits to these files or robot-core apply without a restart.
@@ -452,13 +452,13 @@ class DriveController:
 
     def print_status(self, index, forward_speed, sideways_speed, yaw_rate,
                      tipped=False):
-        """Print one robot's motion, skipping robots sitting still."""
+        """Print one robot's motion, skipping robots that aren't moving."""
         moving = (
             abs(forward_speed) > 0.01
             or abs(sideways_speed) > 0.01
             or abs(yaw_rate) > 0.05
         )
-        if not moving and self.v_left == 0.0 and self.v_right == 0.0:
+        if not moving:
             return
         print(
             f"{self.prims[index].GetPath()}: "

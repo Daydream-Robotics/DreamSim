@@ -277,8 +277,7 @@ STATUS_INTERVAL = 0.05
 # Autonomous (P key in drive_controller.py, and test_mpc_bridge.py): the
 # JerryIO file whose paths robot-core's MPC follows, in order.
 MPC_PATH_FILE = (
-    ROBOT_CORE / "common-utils" / "paths" / "unit_tests" / "auton"
-    / "auton.path.jerryio.txt"
+    REPO_ROOT / "paths" / "twin_test_path.txt"
 )
 # Battery voltage reported to the MPC. The motor model has no sag, so this
 # matches the 12 V it drives with.
