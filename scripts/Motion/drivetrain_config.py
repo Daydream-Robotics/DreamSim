@@ -241,7 +241,7 @@ WHEEL_ROLLING_FRICTION = 0.93
 # compromise. Calibrate against the real robot: time a +/-12 V spin in
 # place, measure a 12 V / 6 V arc, and measure the drift after a turn at
 # full forward, then adjust until the sim matches.
-WHEEL_SIDEWAYS_FRICTION = 0.125
+WHEEL_SIDEWAYS_FRICTION = 0.3
 
 # Rolling resistance and drivetrain drag, as a fraction of each wheel's
 # load. Without it the motors' braking fades as the robot slows, leaving a
