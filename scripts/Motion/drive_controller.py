@@ -9,13 +9,19 @@ the Property panel, tick it, then save the stage.
 
 Controls: W/S drive, A/D turn, Space clears all input. The keys are mixed
 into left/right side voltages, the same inputs robot-core's MPC produces.
+
+P runs autonomous: the first robot is placed at the start of
+config.MPC_PATH_FILE and robot-core's MPC drives its paths in order (see
+autonomous.py), printing a summary per path. Any drive key or Space takes
+back control. Isaac Sim's world axes are taken as JerryIO's field frame
+(field centred on the origin, +x away from the red driver station).
 Each physics step, every side's voltage and wheel speed go through a V5
 motor model to get that side's drive force, shared across its wheels.
 Each wheel also resists sliding sideways, up to its friction limit. The
 robot's own collider has almost no friction, so all grip comes from the
 wheels.
 
-Settings live in drive_config.py next to this file, which reads the
+Settings live in drivetrain_config.py next to this file, which reads the
 robot's values from robot-core. Edits to either take effect on re-run.
 """
 
@@ -52,10 +58,10 @@ def find_motion_dir():
             candidates.append(parent / "scripts" / "Motion")
 
     for candidate in candidates:
-        if (candidate / "drive_config.py").is_file():
+        if (candidate / "drivetrain_config.py").is_file():
             return candidate
     raise RuntimeError(
-        "Couldn't find scripts/Motion/drive_config.py. Open a scene from "
+        "Couldn't find scripts/Motion/drivetrain_config.py. Open a scene from "
         "the DreamSim repo with File > Open, then run this again."
     )
 
@@ -64,10 +70,19 @@ _motion_dir = str(find_motion_dir())
 if _motion_dir not in sys.path:
     sys.path.insert(0, _motion_dir)
 
-import drive_config as config  # noqa: E402
+import autonomous  # noqa: E402
+import drivetrain_config as config  # noqa: E402
+import drivetrain_model as model  # noqa: E402
+import mpc_bridge  # noqa: E402
+import path_display  # noqa: E402
 
-# Reload so edits to drive_config.py or robot-core apply without a restart.
+# Reload so edits to these files or robot-core apply without a restart.
+# Config first: the others read it when they load.
 config = importlib.reload(config)
+mpc_bridge = importlib.reload(mpc_bridge)
+model = importlib.reload(model)
+autonomous = importlib.reload(autonomous)
+path_display = importlib.reload(path_display)
 
 
 def find_robot_prims(stage):
@@ -102,6 +117,15 @@ def setup_rigid_body(prim):
     physx_body = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     physx_body.CreateLinearDampingAttr().Set(config.LINEAR_DAMPING)
     physx_body.CreateAngularDampingAttr().Set(config.ANGULAR_DAMPING)
+    # Never sleep. PhysX puts slow bodies to sleep (default threshold 5e-5,
+    # which a robot creeping at a few deg/s is under). A sleeping body stops
+    # being simulated, and its velocity reads back stale: the robot showed a
+    # constant turn rate at 0 V that the wheel model could never damp out.
+    physx_body.CreateSleepThresholdAttr().Set(0.0)
+    # Likewise no stabilization, which also treats slow bodies as resting.
+    # With it on, the robot sat still while PhysX reported a constant
+    # -4 deg/s turn (the heading didn't change over 5 s).
+    physx_body.CreateStabilizationThresholdAttr().Set(0.0)
 
 
 def setup_robot_material(stage, prims):
@@ -161,86 +185,6 @@ def setup_physics_scenes(stage):
         )
 
 
-def arcade_to_tank(drive, steer):
-    """Mix drive and steer in [-1, 1] into (left, right) side voltages."""
-    left = drive - steer
-    right = drive + steer
-    # Scale both sides down together so turning still works at full drive.
-    scale = max(1.0, abs(left), abs(right))
-    max_voltage = config.MAX_VOLTAGE
-    return max_voltage * left / scale, max_voltage * right / scale
-
-
-def clamp(value, limit):
-    """Limit value to the range [-limit, limit]."""
-    return max(-limit, min(limit, value))
-
-
-def motor_torque(voltage, motor_speed, brake=False):
-    """Output torque of one motor from its voltage and speed (rad/s).
-
-    At exactly 0 V the motor coasts (no torque) unless brake is set or
-    config.DRIVE_BRAKE_MODE is "brake".
-    """
-    if voltage == 0.0 and not brake and config.DRIVE_BRAKE_MODE == "coast":
-        return 0.0
-    back_emf = motor_speed / config.MOTOR_KV
-    current = (voltage - back_emf) / config.MOTOR_RESISTANCE
-    current = clamp(current, config.CURRENT_LIMIT)
-    return config.MOTOR_KT * current
-
-
-def side_force(voltage, ground_speed, brake=False):
-    """Force one drive side puts on the ground, from its ground speed."""
-    wheel_speed = ground_speed / config.WHEEL_RADIUS
-    motor_speed = wheel_speed / config.DRIVE_GEAR_RATIO
-    torque = motor_torque(voltage, motor_speed, brake)
-    wheel_torque = config.MOTORS_PER_SIDE * torque / config.DRIVE_GEAR_RATIO
-    return wheel_torque / config.WHEEL_RADIUS
-
-
-def drive_wrench(v_left, v_right, forward_speed, sideways_speed, yaw_rate,
-                 dt, brake=False):
-    """Net body-frame force (x, y) and yaw torque from all the wheels.
-
-    brake makes sides at 0 V brake even when the drive is set to coast.
-
-    Speeds are in the robot's frame: x forward, y left, z up.
-    """
-    wheel_count = 2 * config.WHEELS_PER_SIDE
-    normal_force = config.ROBOT_MASS * config.GRAVITY / wheel_count
-    rolling_limit = config.WHEEL_ROLLING_FRICTION * normal_force
-    sideways_limit = config.WHEEL_SIDEWAYS_FRICTION * normal_force
-    resistance_limit = config.WHEEL_ROLLING_RESISTANCE * normal_force
-    # Force per m/s of slip that removes GRIP_RESPONSE of a wheel's slip in
-    # one step. Used for sideways grip and rolling resistance.
-    grip_gain = config.GRIP_RESPONSE * config.ROBOT_MASS / wheel_count / dt
-
-    force_x = 0.0
-    force_y = 0.0
-    torque_z = 0.0
-    half_track = config.TRACK_WIDTH / 2.0
-    for side_y, voltage in ((half_track, v_left), (-half_track, v_right)):
-        side_speed = forward_speed - yaw_rate * side_y
-        side = side_force(voltage, side_speed, brake)
-        per_wheel = side / config.WHEELS_PER_SIDE
-        # Beyond the friction limit the wheel spins instead of pushing.
-        drive = clamp(per_wheel, rolling_limit)
-        # Resistance opposes rolling and holds the robot once stopped.
-        resistance = clamp(-grip_gain * side_speed, resistance_limit)
-        push = drive + resistance
-
-        for wheel_x in config.WHEEL_X_POSITIONS:
-            slip = sideways_speed + yaw_rate * wheel_x
-            grip = clamp(-grip_gain * slip, sideways_limit)
-
-            force_x += push
-            force_y += grip
-            torque_z += wheel_x * grip - side_y * push
-
-    return force_x, force_y, torque_z
-
-
 def quaternion_to_matrix(quaternion):
     """Body-to-world rotation matrix from an Isaac Sim [w, x, y, z]
     quaternion. Its columns are the body's x, y and z axes in world space.
@@ -266,6 +210,7 @@ class DriveController:
         self.keyboard_subscription = None
         self.timeline_subscription = None
         self.physics_callback = None
+        self.output_file = None
         self.prims = prims
         self.v_left = 0.0
         self.v_right = 0.0
@@ -273,6 +218,8 @@ class DriveController:
         self.status_time = 0.0
         self.voltages_changed = False
         self.rate_checked = False
+        self.autonomous = None
+        self.pending_autonomous = None
 
         self.timeline = omni.timeline.get_timeline_interface()
 
@@ -300,8 +247,14 @@ class DriveController:
             self.on_timeline_event
         )
 
+        # Position and path output goes to a file, overwritten each run.
+        self.output_file = open(
+            config.OUTPUT_FILE, "w", encoding="utf-8", buffering=1
+        )
+
         paths = ", ".join(str(prim.GetPath()) for prim in self.prims)
         print(f"Tank controller loaded for: {paths}")
+        print(f"Position and path output: {config.OUTPUT_FILE}")
 
         # Compare the motor model with the robot's identified model.
         model_speed = (
@@ -328,15 +281,15 @@ class DriveController:
         # Letting go of every key brakes, if the config asks for it.
         released = drive == 0 and steer == 0
         brake = released and config.KEYBOARD_BRAKE_ON_RELEASE
-        self.set_voltages(*arcade_to_tank(drive, steer), brake=brake)
+        self.set_voltages(*model.arcade_to_tank(drive, steer), brake=brake)
 
     def set_voltages(self, v_left, v_right, brake=False):
         """Set the side voltages, clamped to +/-config.MAX_VOLTAGE.
 
         brake makes sides at 0 V brake even when the drive is set to coast.
         """
-        v_left = clamp(v_left, config.MAX_VOLTAGE)
-        v_right = clamp(v_right, config.MAX_VOLTAGE)
+        v_left = model.clamp(v_left, config.MAX_VOLTAGE)
+        v_right = model.clamp(v_right, config.MAX_VOLTAGE)
         if (v_left, v_right, brake) != (self.v_left, self.v_right, self.brake):
             self.voltages_changed = True
         self.v_left = v_left
@@ -348,8 +301,9 @@ class DriveController:
         if dt <= 0.0 or not self.robots.is_physics_tensor_entity_valid():
             return
 
-        _, orientations = self.robots.get_world_poses()
+        positions, orientations = self.robots.get_world_poses()
         linear_velocities, angular_velocities = self.robots.get_velocities()
+        positions = to_numpy(positions)
         orientations = to_numpy(orientations)
         linear_velocities = to_numpy(linear_velocities)
         angular_velocities = to_numpy(angular_velocities)
@@ -357,6 +311,14 @@ class DriveController:
         if not self.rate_checked:
             self.rate_checked = True
             self.check_physics_rate(dt)
+
+        # The robot is moved to the path start here, between physics steps,
+        # and the MPC takes over from the next step.
+        if self.pending_autonomous is not None:
+            run = self.pending_autonomous
+            self.pending_autonomous = None
+            self.start_autonomous(run, positions[0])
+            return
 
         # Print on a fixed interval, and on the step a key press or release
         # changes the voltages so the instant of the change is captured.
@@ -382,13 +344,22 @@ class DriveController:
 
             # Tipped over: the wheels aren't on the ground.
             tipped = rotation[2][2] < math.cos(config.MAX_WHEEL_TILT)
+            if tipped and i == 0 and self.autonomous is not None:
+                self.cancel_autonomous("the robot tipped over")
             if tipped:
                 if print_status:
                     self.print_status(
-                        i, forward_speed, sideways_speed, yaw_rate,
-                        tipped=True,
+                        i, positions[i], rotation, forward_speed,
+                        sideways_speed, yaw_rate, tipped=True,
                     )
                 continue
+
+            # Autonomous drives from the first robot's state. Its voltages
+            # are set before any wrench is computed this step.
+            if i == 0 and self.autonomous is not None:
+                self.step_autonomous(
+                    positions[0], rotation, forward_speed, yaw_rate
+                )
 
             # TODO(real robot): the wheel forces are summed about the body
             # origin, which assumes the centre of mass is there, and they
@@ -396,7 +367,7 @@ class DriveController:
             # cube, sum them about its actual centre of mass (or apply each
             # at its contact point with apply_forces_and_torques_at_pos's
             # positions) so an off-centre mass and pitching show up.
-            force_x, force_y, torque_z = drive_wrench(
+            force_x, force_y, torque_z = model.drive_wrench(
                 self.v_left, self.v_right,
                 forward_speed, sideways_speed, yaw_rate, dt, self.brake,
             )
@@ -406,12 +377,137 @@ class DriveController:
 
             if print_status:
                 self.print_status(
-                    i, forward_speed, sideways_speed, yaw_rate
+                    i, positions[i], rotation, forward_speed,
+                    sideways_speed, yaw_rate,
                 )
 
         self.robots.apply_forces_and_torques_at_pos(
             forces=forces, torques=torques, local_frame=True
         )
+
+    def prepare_autonomous(self):
+        """Load the path file and draw its paths (P key).
+
+        Runs from the keyboard handler, outside the physics step, so the
+        drawing doesn't change the stage mid-step. The next physics step
+        places the robot and starts driving.
+        """
+        self.cancel_autonomous()
+        self.discard_pending_autonomous()
+        try:
+            run = autonomous.Autonomous(config.MPC_PATH_FILE, log=self.output)
+        except Exception as error:
+            carb.log_error(f"Autonomous not started: {error}")
+            return
+
+        if config.SHOW_MPC_PATHS:
+            try:
+                self.draw_paths(run.bridge)
+            except Exception as error:
+                carb.log_warn(f"Couldn't draw the path: {error}")
+
+        self.pending_autonomous = run
+
+    def draw_paths(self, bridge):
+        """Draw the bridge's paths, coloured per config.PATH_DISPLAY_SPEED."""
+        paths = []
+        for i in range(bridge.path_count):
+            samples = bridge.samples(i)
+            if config.PATH_DISPLAY_SPEED == "reference":
+                speeds = bridge.reference_speeds(i)
+                samples = [
+                    (x, y, speed) for (x, y, _), speed in zip(samples, speeds)
+                ]
+            paths.append(samples)
+
+        v_min, v_max = path_display.draw_paths(
+            omni.usd.get_context().get_stage(), paths,
+            height=config.PATH_DISPLAY_HEIGHT,
+            width=config.PATH_DISPLAY_WIDTH,
+            session=True,
+        )
+        if config.PATH_DISPLAY_SPEED == "reference":
+            self.output(
+                f"Path coloured by MPC reference speed: {v_min:.1f} in/s "
+                f"(red) to {v_max:.1f} in/s (green)"
+            )
+        else:
+            self.output(
+                f"Path coloured by the file's speeds: {v_min:.1f} (red) to "
+                f"{v_max:.1f} (green)"
+            )
+
+    def discard_pending_autonomous(self):
+        if self.pending_autonomous is not None:
+            self.pending_autonomous.close()
+            self.pending_autonomous = None
+
+    def start_autonomous(self, run, current_position):
+        """Move the first robot to the run's start pose and start it."""
+        self.autonomous = run
+
+        x, y, heading = self.autonomous.start_pose()
+        yaw = model.yaw_from_heading(heading)
+        position = [x * config.INCH, y * config.INCH, current_position[2]]
+        orientation = [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)]
+        self.robots.set_world_poses(
+            positions=np.array([position], dtype=np.float32),
+            orientations=np.array([orientation], dtype=np.float32),
+            indices=[0],
+        )
+        self.robots.set_velocities(
+            np.zeros((1, 3), dtype=np.float32),
+            np.zeros((1, 3), dtype=np.float32),
+            indices=[0],
+        )
+        self.keys.clear()
+        self.set_voltages(0.0, 0.0, brake=True)
+
+        self.output(
+            f"Autonomous: {self.autonomous.bridge.path_count} paths from "
+            f"{config.MPC_PATH_FILE}"
+        )
+        self.output(
+            f"Robot placed at ({x:.1f}, {y:.1f}) in, heading "
+            f"{math.degrees(heading):.0f} deg. Drive keys or Space take "
+            "back control."
+        )
+        if len(self.prims) > 1:
+            self.output(
+                "Autonomous follows the first robot; the others get the "
+                "same voltages."
+            )
+
+    def step_autonomous(self, position, rotation, forward_speed, yaw_rate):
+        """Run one physics step of autonomous from the first robot's state."""
+        yaw = math.atan2(rotation[1][0], rotation[0][0])
+        omega_left, omega_right = model.wheel_speeds(forward_speed, yaw_rate)
+        v_left, v_right, brake = self.autonomous.physics_step(
+            position[0] / config.INCH,
+            position[1] / config.INCH,
+            model.heading_from_yaw(yaw),
+            omega_left,
+            omega_right,
+        )
+        self.set_voltages(v_left, v_right, brake=brake)
+        if self.autonomous.done and v_left == 0.0 and v_right == 0.0:
+            self.autonomous.close()
+            self.autonomous = None
+
+    def cancel_autonomous(self, reason=None):
+        """Stop autonomous, if running, and brake."""
+        if self.autonomous is None:
+            return
+        self.autonomous.close()
+        self.autonomous = None
+        self.set_voltages(0.0, 0.0, brake=True)
+        if reason:
+            self.output(f"Autonomous stopped: {reason}.")
+
+    def output(self, line):
+        """Write a position or path line to config.OUTPUT_FILE."""
+        if self.output_file is not None:
+            self.output_file.write(line + "\n")
 
     def check_physics_rate(self, dt):
         """Report the rate PhysX actually runs at, from the step length."""
@@ -426,36 +522,62 @@ class DriveController:
                 "else is setting the physics rate."
             )
 
-    def print_status(self, index, forward_speed, sideways_speed, yaw_rate,
-                     tipped=False):
-        """Print one robot's motion, skipping robots sitting still."""
+    def print_status(self, index, position, rotation, forward_speed,
+                     sideways_speed, yaw_rate, tipped=False):
+        """Write one robot's pose and motion to the output file, skipping
+        robots that aren't moving.
+
+        Position and heading are in robot-core's field frame (inches,
+        heading 0 along +y, clockwise). The heading comes from the pose,
+        not the velocity, so a turn rate that doesn't match a changing
+        heading points at a bad reading.
+        """
         moving = (
             abs(forward_speed) > 0.01
             or abs(sideways_speed) > 0.01
             or abs(yaw_rate) > 0.05
         )
-        if not moving and self.v_left == 0.0 and self.v_right == 0.0:
+        if not moving:
             return
-        print(
+        yaw = math.atan2(rotation[1][0], rotation[0][0])
+        heading = math.degrees(model.heading_from_yaw(yaw))
+        self.output(
             f"{self.prims[index].GetPath()}: "
+            f"x {position[0] / config.INCH:+7.2f} in  "
+            f"y {position[1] / config.INCH:+7.2f} in  "
             f"V {self.v_left:+5.1f}/{self.v_right:+5.1f}  "
             f"forward {forward_speed / config.INCH:+6.1f} in/s  "
             f"sideways {sideways_speed / config.INCH:+6.1f} in/s  "
-            f"turn {math.degrees(yaw_rate):+6.0f} deg/s"
+            f"turn {math.degrees(yaw_rate):+6.0f} deg/s  "
+            f"heading {heading:+7.2f} deg"
             + ("  TIPPED, wheels off" if tipped else "")
         )
 
     def on_keyboard(self, event, *args):
         key = carb.input.KeyboardInput
         controlled_keys = {key.W, key.A, key.S, key.D, key.SPACE}
+        pressed = event.type in (
+            carb.input.KeyboardEventType.KEY_PRESS,
+            carb.input.KeyboardEventType.KEY_REPEAT,
+        )
+
+        # P starts (or restarts) autonomous: the path is drawn now, the
+        # robot moves on the next physics step.
+        if event.input == key.P:
+            if (
+                event.type == carb.input.KeyboardEventType.KEY_PRESS
+                and self.timeline.is_playing()
+            ):
+                self.prepare_autonomous()
+            return True
 
         if event.input not in controlled_keys:
             return True
 
-        if event.type in (
-            carb.input.KeyboardEventType.KEY_PRESS,
-            carb.input.KeyboardEventType.KEY_REPEAT,
-        ):
+        if pressed and self.autonomous is not None:
+            self.cancel_autonomous("taken over by the keyboard")
+
+        if pressed:
             if event.input == key.SPACE:
                 self.clear_input()
                 return True
@@ -466,6 +588,9 @@ class DriveController:
 
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             self.keys.discard(event.input)
+            # Releasing a key held from before doesn't override autonomous.
+            if self.autonomous is not None:
+                return True
 
         self.update_voltages()
         return True
@@ -475,6 +600,8 @@ class DriveController:
             int(omni.timeline.TimelineEventType.STOP),
             int(omni.timeline.TimelineEventType.PAUSE),
         ):
+            self.discard_pending_autonomous()
+            self.cancel_autonomous("the simulation stopped")
             self.clear_input()
 
     def clear_input(self):
@@ -484,6 +611,8 @@ class DriveController:
         )
 
     def shutdown(self):
+        self.discard_pending_autonomous()
+        self.cancel_autonomous()
         self.clear_input()
 
         if self.physics_callback is not None:
@@ -497,6 +626,10 @@ class DriveController:
             self.keyboard_subscription = None
 
         self.timeline_subscription = None
+
+        if self.output_file is not None:
+            self.output_file.close()
+            self.output_file = None
 
 
 async def load_tank_controls():

@@ -6,7 +6,7 @@
 │   ├── src/            # Core Simulation Logic & Scripts
 │   │   │               # "anything robot do"
 │   │   ├── train_ppo.py  # PPO training script
-│   │   ├── drive_model.py # Robot drivetrain model
+│   │   ├── drivetrain_model.py # Robot drivetrain model
 │   │   └── perception.py # Perception module
 │   │
 │   ├── assets/         # Importable Simulation Assets

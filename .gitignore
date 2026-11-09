@@ -434,3 +434,6 @@ IsaacLab/
 
 # CMake build output
 build/
+
+# Drive controller position and path output, overwritten each run
+output_latest.txt

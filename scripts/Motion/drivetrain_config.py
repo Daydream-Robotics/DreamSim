@@ -21,10 +21,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROBOT_CORE = (
     REPO_ROOT / "native" / "robotcore_mpc" / "third_party" / "robotcore"
 )
-MPC_CONFIG_HEADER = ROBOT_CORE / "shared" / "include" / "mpc" / "mpcConfig.hpp"
-BRAIN_CONFIG_DIR = ROBOT_CORE / "v5-brain" / "include" / "config"
-BRAIN_CONSTANTS_HEADER = BRAIN_CONFIG_DIR / "constants.h"
-BRAIN_SUBSYSTEMS_HEADER = BRAIN_CONFIG_DIR / "subsystems.hpp"
+SHARED_CONFIG_DIR = ROBOT_CORE / "shared" / "include" / "config"
+CONSTANTS_HEADER = SHARED_CONFIG_DIR / "constants.h"
+LINK_CONSTANTS_HEADER = SHARED_CONFIG_DIR / "linkConstants.hpp"
+BRAIN_SUBSYSTEMS_HEADER = (
+    ROBOT_CORE / "v5-brain" / "include" / "config" / "subsystems.hpp"
+)
 
 CARTRIDGE_RPMS = {"red": 100.0, "green": 200.0, "blue": 600.0}
 
@@ -95,22 +97,25 @@ def read_cartridge_rpm(path, motor_group):
 
 
 # Robot values from robot-core.
-_mpc = read_constants(MPC_CONFIG_HEADER)
-_brain = read_constants(BRAIN_CONSTANTS_HEADER)
+_robot = read_constants(CONSTANTS_HEADER)
 
-WHEEL_RADIUS = _mpc["WHEEL_RADIUS"] * INCH
-CONTROL_PERIOD = _mpc["H"]  # s
-MOTOR_A = _mpc["MOTOR_A"]  # 1/s
-MOTOR_B = _mpc["MOTOR_B"]  # rad/s^2 per V, wheel side
+WHEEL_RADIUS = _robot["DRIVE_WHEEL_DIAMETER_INCHES"] / 2.0 * INCH
+DRIVE_GEAR_RATIO = _robot["DRIVE_GEAR_RATIO"]  # wheel speed / motor speed
+TRACK_WIDTH = _robot["TRACK_WIDTH"] * INCH
 
-DRIVE_GEAR_RATIO = _brain["DRIVE_GEAR_RATIO"]  # wheel speed / motor speed
-TRACK_WIDTH = _brain["TRACK_WIDTH"] * INCH
+CONTROL_PERIOD = _robot["MPC_SAMPLE_PERIOD"]  # s
+# Time from the MPC solving to the brain applying its command. The MPC
+# predicts the robot forward over it, so the sim applies each command this
+# much later to match.
+COMMAND_DELAY = _robot["MPC_COMMAND_DELAY"]  # s
+MOTOR_A = _robot["MPC_MOTOR_A"]  # 1/s
+MOTOR_B = _robot["MPC_MOTOR_B"]  # rad/s^2 per V, wheel side
 
 _left_ports = read_define_list(
-    BRAIN_CONSTANTS_HEADER, "LEFT_DRIVE_WHEEL_PORTS"
+    LINK_CONSTANTS_HEADER, "LEFT_DRIVE_WHEEL_PORTS"
 )
 _right_ports = read_define_list(
-    BRAIN_CONSTANTS_HEADER, "RIGHT_DRIVE_WHEEL_PORTS"
+    LINK_CONSTANTS_HEADER, "RIGHT_DRIVE_WHEEL_PORTS"
 )
 if len(_left_ports) != len(_right_ports):
     raise RuntimeError("Left and right drive sides differ in motor count.")
@@ -166,6 +171,15 @@ if not math.isclose(
         f"PHYSICS_STEPS_PER_SECOND ({PHYSICS_STEPS_PER_SECOND}) must fit a "
         f"whole number of steps into robot-core's {CONTROL_PERIOD} s "
         "control period."
+    )
+STEPS_OF_COMMAND_DELAY = round(COMMAND_DELAY * PHYSICS_STEPS_PER_SECOND)
+if not math.isclose(
+    STEPS_OF_COMMAND_DELAY, COMMAND_DELAY * PHYSICS_STEPS_PER_SECOND
+):
+    raise RuntimeError(
+        f"PHYSICS_STEPS_PER_SECOND ({PHYSICS_STEPS_PER_SECOND}) must fit a "
+        f"whole number of steps into robot-core's {COMMAND_DELAY} s "
+        "command delay."
     )
 
 # Kept low: the motor's back-EMF already slows the robot.
@@ -227,7 +241,7 @@ WHEEL_ROLLING_FRICTION = 0.93
 # compromise. Calibrate against the real robot: time a +/-12 V spin in
 # place, measure a 12 V / 6 V arc, and measure the drift after a turn at
 # full forward, then adjust until the sim matches.
-WHEEL_SIDEWAYS_FRICTION = 0.125
+WHEEL_SIDEWAYS_FRICTION = 0.3
 
 # Rolling resistance and drivetrain drag, as a fraction of each wheel's
 # load. Without it the motors' braking fades as the robot slows, leaving a
@@ -259,6 +273,34 @@ ROBOT_COLLIDER_FRICTION = 0.0
 # is moving. A line is also printed on the step where the voltages change.
 # 0 turns them off.
 STATUS_INTERVAL = 0.05
+
+# Autonomous (P key in drive_controller.py, and test_mpc_bridge.py): the
+# JerryIO file whose paths robot-core's MPC follows, in order.
+MPC_PATH_FILE = (
+    REPO_ROOT / "paths" / "twin_test_path.txt"
+)
+# Battery voltage reported to the MPC. The motor model has no sag, so this
+# matches the 12 V it drives with.
+MPC_BATTERY_VOLTS = 12.0
+# Give up on a path that hasn't finished after this long (s). robot-core has
+# no limit, but a robot stuck in the sim would otherwise run forever.
+MPC_PATH_TIMEOUT = 15.0
+
+# Draw MPC_PATH_FILE's paths on the field when autonomous starts: ribbons
+# coloured by path speed (red slow, green fast), drawn in the stage's
+# session layer so saving the scene doesn't keep them.
+SHOW_MPC_PATHS = True
+PATH_DISPLAY_HEIGHT = 0.02  # m above the floor
+PATH_DISPLAY_WIDTH = 0.02  # m
+# What the colour shows: "reference" is the speed robot-core's MPC reference
+# targets (curvature and acceleration limited, from rest, as if tracked
+# perfectly); "file" is the speed column in the JerryIO file.
+PATH_DISPLAY_SPEED = "reference"
+
+# Robot position and path output (status lines, autonomous placement and
+# per-path results). Overwritten each time the controller loads;
+# gitignored.
+OUTPUT_FILE = REPO_ROOT / "output_latest.txt"
 
 # Frames to wait for the timeline to report that it has stopped.
 STOP_TIMEOUT_FRAMES = 60
