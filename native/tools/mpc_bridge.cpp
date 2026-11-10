@@ -168,6 +168,19 @@ BRIDGE_API int mpc_bridge_reference_speeds(const Bridge* bridge, int index, doub
     return count;
 }
 
+// The path point the follower last matched the robot to (in, field frame): the closest-point
+// search in mpc_bridge_step, run on the delay-compensated pose. Returns 0, or -1 with no path.
+BRIDGE_API int mpc_bridge_closest_point(const Bridge* bridge, double* x, double* y) {
+    if (!bridge->path || bridge->path->getSamples().empty()) {
+        return BRIDGE_ERROR;
+    }
+    const std::vector<Sample>& samples = bridge->path->getSamples();
+    const Sample& closest = samples[std::min(bridge->currentSampleIdx, samples.size() - 1)];
+    *x = closest.x;
+    *y = closest.y;
+    return 0;
+}
+
 // Starts following a path (PathFollower::setPath). Returns 0, or -1 for a bad index.
 BRIDGE_API int mpc_bridge_set_path(Bridge* bridge, int index) {
     if (index < 0 || index >= static_cast<int>(bridge->paths.size())) {

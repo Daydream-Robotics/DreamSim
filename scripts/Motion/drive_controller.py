@@ -220,6 +220,9 @@ class DriveController:
         self.rate_checked = False
         self.autonomous = None
         self.pending_autonomous = None
+        # Isaac Sim's debug draw interface: None until first used, False if
+        # it couldn't be loaded.
+        self.debug_draw = None
 
         self.timeline = omni.timeline.get_timeline_interface()
 
@@ -490,9 +493,50 @@ class DriveController:
             omega_right,
         )
         self.set_voltages(v_left, v_right, brake=brake)
+        if config.SHOW_CLOSEST_POINT:
+            self.draw_closest_point()
         if self.autonomous.done and v_left == 0.0 and v_right == 0.0:
             self.autonomous.close()
             self.autonomous = None
+            self.clear_debug_points()
+
+    def draw_closest_point(self):
+        """Mark the path point the follower has matched the robot to."""
+        draw = self.get_debug_draw()
+        point = self.autonomous.bridge.closest_point()
+        if draw is None or point is None:
+            return
+        position = (
+            point[0] * config.INCH,
+            point[1] * config.INCH,
+            config.PATH_DISPLAY_HEIGHT + 0.01,
+        )
+        draw.clear_points()
+        draw.draw_points(
+            [position], [config.CLOSEST_POINT_COLOR],
+            [config.CLOSEST_POINT_SIZE],
+        )
+
+    def get_debug_draw(self):
+        """Isaac Sim's debug draw interface, or None if it isn't available.
+
+        It draws markers on screen without changing the stage, so they can
+        move every physics step.
+        """
+        if self.debug_draw is None:
+            try:
+                from isaacsim.util.debug_draw import _debug_draw
+
+                self.debug_draw = _debug_draw.acquire_debug_draw_interface()
+            except Exception as error:
+                carb.log_warn(f"Debug markers unavailable: {error}")
+                self.debug_draw = False
+        return self.debug_draw or None
+
+    def clear_debug_points(self):
+        draw = self.debug_draw or None
+        if draw is not None:
+            draw.clear_points()
 
     def cancel_autonomous(self, reason=None):
         """Stop autonomous, if running, and brake."""
@@ -500,6 +544,7 @@ class DriveController:
             return
         self.autonomous.close()
         self.autonomous = None
+        self.clear_debug_points()
         self.set_voltages(0.0, 0.0, brake=True)
         if reason:
             self.output(f"Autonomous stopped: {reason}.")
@@ -613,6 +658,7 @@ class DriveController:
     def shutdown(self):
         self.discard_pending_autonomous()
         self.cancel_autonomous()
+        self.clear_debug_points()
         self.clear_input()
 
         if self.physics_callback is not None:
