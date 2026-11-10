@@ -80,6 +80,10 @@ def _load_library():
         [ctypes.c_void_p, ctypes.c_int, _double_p, ctypes.c_int]
     )
     library.mpc_bridge_reference_speeds.restype = ctypes.c_int
+    library.mpc_bridge_closest_point.argtypes = (
+        [ctypes.c_void_p] + [_double_p] * 2
+    )
+    library.mpc_bridge_closest_point.restype = ctypes.c_int
     library.mpc_bridge_set_path.argtypes = [ctypes.c_void_p, ctypes.c_int]
     library.mpc_bridge_set_path.restype = ctypes.c_int
     library.mpc_bridge_step.argtypes = (
@@ -149,6 +153,17 @@ class MpcBridge:
             self._handle, index, speeds, count
         )
         return list(speeds[:count])
+
+    def closest_point(self):
+        """The path point the follower last matched the robot to, as
+        (x in, y in), or None if no path is set. Matched on the
+        delay-compensated pose, so it can sit slightly ahead of the robot.
+        """
+        x, y = ctypes.c_double(), ctypes.c_double()
+        status = self._library.mpc_bridge_closest_point(
+            self._handle, ctypes.byref(x), ctypes.byref(y)
+        )
+        return (x.value, y.value) if status == 0 else None
 
     def set_path(self, index):
         """Start following path index (0-based)."""

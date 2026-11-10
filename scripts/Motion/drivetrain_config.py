@@ -297,6 +297,13 @@ PATH_DISPLAY_WIDTH = 0.02  # m
 # perfectly); "file" is the speed column in the JerryIO file.
 PATH_DISPLAY_SPEED = "reference"
 
+# Debug: a dot on the path point the follower has matched the robot to,
+# updated every physics step during autonomous. The match uses the MPC's
+# delay-compensated pose, so the dot can sit slightly ahead of the robot.
+SHOW_CLOSEST_POINT = True
+CLOSEST_POINT_COLOR = (0.1, 0.5, 1.0, 1.0)  # RGBA, blue
+CLOSEST_POINT_SIZE = 15  # pixels
+
 # Robot position and path output (status lines, autonomous placement and
 # per-path results). Overwritten each time the controller loads;
 # gitignored.
