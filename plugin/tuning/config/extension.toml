@@ -1,0 +1,15 @@
+[package]
+version = "0.1.0"
+category = "Simulation"
+title = "DreamSim MPC Tuning"
+description = "Tuning suite for robot-core's MPC constants (shared/include/config/constants.h), driven in Isaac Sim. Physics constants stay fixed."
+authors = ["Daydream Robotics"]
+keywords = ["dreamsim", "mpc", "tuning", "robot-core"]
+readme = "docs/README.md"
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.menu.utils" = {}
+
+[[python.module]]
+name = "dreamsim.tuning"
