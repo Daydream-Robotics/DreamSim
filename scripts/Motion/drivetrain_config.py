@@ -204,7 +204,7 @@ ROBOT_HEIGHT = 12.0 * INCH
 # TODO(real robot): approximation tuned by feel. Get the real value from
 # CAD mass properties, a bifilar pendulum test, or by matching the real
 # robot's spin-up time at +/-12 V.
-ROBOT_INERTIA_SCALE = 0.3
+ROBOT_INERTIA_SCALE = 0.35
 ROBOT_INERTIA = tuple(
     ROBOT_INERTIA_SCALE * ROBOT_MASS * (a**2 + b**2) / 12.0
     for a, b in (
@@ -285,14 +285,14 @@ STATUS_INTERVAL = 0.05
 # Autonomous (P key in drive_controller.py, and test_mpc_bridge.py): the
 # JerryIO file whose paths robot-core's MPC follows, in order.
 MPC_PATH_FILE = (
-    REPO_ROOT / "paths" / "twin_test_path.txt"
+    REPO_ROOT / "paths" / "loop-d-lewpe.txt"
 )
 # Battery voltage reported to the MPC. The motor model has no sag, so this
 # matches the 12 V it drives with.
 MPC_BATTERY_VOLTS = 12.0
 # Give up on a path that hasn't finished after this long (s). robot-core has
 # no limit, but a robot stuck in the sim would otherwise run forever.
-MPC_PATH_TIMEOUT = 15.0
+MPC_PATH_TIMEOUT = 30.0
 
 # MPC tuning, sim only: parameters to use instead of robot-core's
 # constants.h, without rebuilding. Empty runs robot-core's values. Keys are
