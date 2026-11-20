@@ -12,6 +12,7 @@ pi/2 along +x (clockwise).
 
 import drivetrain_config as config
 import mpc_bridge
+import mpc_constraints
 
 
 class PathResult:
@@ -42,9 +43,22 @@ class PathResult:
 class Autonomous:
     """Follows every path in a JerryIO file in order."""
 
-    def __init__(self, path_file, log=print):
+    def __init__(self, path_file, log=print, overrides=None):
+        """overrides: MPC parameters instead of robot-core's (a dict by
+        mpc_bridge.PARAM_NAMES); None uses config.MPC_TUNING.
+        """
         self.log = log
-        self.bridge = mpc_bridge.MpcBridge(path_file)
+        if overrides is None:
+            overrides = config.MPC_TUNING
+        self.bridge = mpc_bridge.MpcBridge(path_file, overrides)
+        if overrides:
+            defaults = mpc_bridge.default_params()
+            changes = ", ".join(
+                f"{name} {defaults[name]:g} -> {value:g}"
+                for name, value in overrides.items()
+            )
+            self.log(f"MPC tuning (sim only): {changes}")
+        self.constraint_log = mpc_constraints.open_log(self.bridge)
         self.results = []
         self.done = False
         self._step = 0
@@ -58,6 +72,8 @@ class Autonomous:
         return self.bridge.start_pose()
 
     def close(self):
+        if self.constraint_log is not None:
+            self.constraint_log.close()
         self.bridge.close()
 
     def physics_step(self, x, y, heading, omega_left, omega_right):
@@ -75,7 +91,7 @@ class Autonomous:
             self.results[-1].steps += 1
             limit = config.MPC_PATH_TIMEOUT * config.PHYSICS_STEPS_PER_SECOND
             if self.results[-1].steps > limit:
-                self.log(self.results[-1].summary())
+                self._log_result(self.results[-1])
                 self.log("Autonomous stopped: path timed out.")
                 self.done = True
                 self._send(0.0, 0.0, brake=True)
@@ -85,6 +101,13 @@ class Autonomous:
     def _start_path(self, index):
         self.bridge.set_path(index)
         self.results.append(PathResult(index))
+        if self.constraint_log is not None:
+            self.constraint_log.start_path()
+
+    def _log_result(self, result):
+        self.log(result.summary())
+        if self.constraint_log is not None:
+            self.log(self.constraint_log.tally.summary())
 
     def _send(self, v_left, v_right, brake=False):
         apply_at = self._step + config.STEPS_OF_COMMAND_DELAY
@@ -104,7 +127,7 @@ class Autonomous:
 
             if status == mpc_bridge.FINISHED:
                 result.finished = True
-                self.log(result.summary())
+                self._log_result(result)
                 self._send(0.0, 0.0, brake=True)
                 if result.index + 1 < self.bridge.path_count:
                     self._start_path(result.index + 1)
@@ -121,5 +144,10 @@ class Autonomous:
 
             if status == mpc_bridge.SOLVE_FAILED:
                 result.failed_solves += 1
+            elif self.constraint_log is not None:
+                self.constraint_log.record(
+                    self._step / config.PHYSICS_STEPS_PER_SECOND,
+                    result.index, x, y, heading, off_path,
+                )
             self._send(v_left, v_right)
             return

@@ -9,6 +9,10 @@
 //
 // Frames and units are robot-core's: JerryIO field frame (field-centre origin, +x forward,
 // +y left), inches, theta 0 along +y and pi/2 along +x, wheel speeds in rad/s at the wheel.
+//
+// For tuning in the sim, the MPC's parameters can be overridden at runtime
+// (mpc_bridge_set_params) and the last solve's constraints read back (mpc_bridge_constraints).
+// Neither changes robot-core: the real robot always uses constants.h.
 #include "config/constants.h"
 #include "motion/control/mpc.hpp"
 #include "motion/pathing/paths.hpp"
@@ -36,17 +40,123 @@ enum BridgeStatus {
     BRIDGE_ERROR = -1,
 };
 
+// The MPC parameters Python can override, in the order mpc_bridge_default_params and
+// mpc_bridge_set_params use. Keep in sync with PARAM_NAMES in scripts/Motion/mpc_bridge.py.
+enum ParamIndex {
+    PARAM_MOTOR_A,
+    PARAM_MOTOR_B,
+    PARAM_P_X,
+    PARAM_P_Y,
+    PARAM_P_THETA,
+    PARAM_Q_U,
+    PARAM_Q_ZERO_MULT,
+    PARAM_Q_FINAL_MULT,
+    PARAM_P_FINAL_MULT,
+    PARAM_V_MAX,
+    PARAM_DELTA_U_MAX,
+    PARAM_DELTA_U_MIN,
+    PARAM_X_FIELD_MAX,
+    PARAM_Y_FIELD_MAX,
+    PARAM_OMEGA_WHEEL_MAX,
+    PARAM_COUNT,
+};
+
+// MPC keeps its last QP private. Naming a private member is allowed in an explicit template
+// instantiation, so this reads them without changing robot-core. Read-only, for debugging.
+template <typename Tag, typename Tag::type Member>
+struct PrivateAccess {
+    friend typename Tag::type privateMember(Tag) { return Member; }
+};
+
+constexpr int CONTROL_HORIZON = static_cast<int>(MPC_CONTROL_HORIZON);
+constexpr int PREDICTION_HORIZON = static_cast<int>(MPC_PREDICTION_HORIZON);
+constexpr int INPUT_COUNT = 2 * CONTROL_HORIZON;
+// rows of G*U <= b in MPCController::assembleConstraints order: slew, voltage and battery
+// (2 * INPUT_COUNT rows each), then field position and wheel speed (4 * F rows each)
+constexpr int CONSTRAINT_ROWS = 6 * INPUT_COUNT + 8 * PREDICTION_HORIZON;
+
+struct SolverTag {
+    using type = OSQPSolver* MPC::*;
+    friend type privateMember(SolverTag);
+};
+struct ConstraintMatrixTag {
+    using type = Eigen::Matrix<double, CONSTRAINT_ROWS, INPUT_COUNT> MPC::*;
+    friend type privateMember(ConstraintMatrixTag);
+};
+struct ConstraintBoundTag {
+    using type = Eigen::Matrix<double, CONSTRAINT_ROWS, 1> MPC::*;
+    friend type privateMember(ConstraintBoundTag);
+};
+template struct PrivateAccess<SolverTag, &MPC::m_solver>;
+template struct PrivateAccess<ConstraintMatrixTag, &MPC::m_G>;
+template struct PrivateAccess<ConstraintBoundTag, &MPC::m_b>;
+
 struct Bridge {
     std::vector<ALS_Path> paths;
     std::vector<PathFlag> flags;
     Pose startPose{0.0, 0.0, 0.0};
 
-    MPC mpc;
+    MPC::Params params;
+    std::unique_ptr<MPC> mpc = std::make_unique<MPC>(params);
     const ALS_Path* path = nullptr;
     PathFlag flag = PathFlag::FORWARDS;
     std::size_t currentSampleIdx = 0;
     bool finished = true;
+    // the last mpc_bridge_step solved, so its constraints can be read
+    bool solved = false;
 };
+
+static void paramsToArray(const MPC::Params& p, double* values) {
+    values[PARAM_MOTOR_A] = p.a;
+    values[PARAM_MOTOR_B] = p.b;
+    values[PARAM_P_X] = p.p_x;
+    values[PARAM_P_Y] = p.p_y;
+    values[PARAM_P_THETA] = p.p_theta;
+    values[PARAM_Q_U] = p.q_u;
+    values[PARAM_Q_ZERO_MULT] = p.q_zero_multiplier;
+    values[PARAM_Q_FINAL_MULT] = p.q_final_multiplier;
+    values[PARAM_P_FINAL_MULT] = p.p_final_multiplier;
+    values[PARAM_V_MAX] = p.V_max;
+    values[PARAM_DELTA_U_MAX] = p.delta_u_max;
+    values[PARAM_DELTA_U_MIN] = p.delta_u_min;
+    values[PARAM_X_FIELD_MAX] = p.x_field_max;
+    values[PARAM_Y_FIELD_MAX] = p.y_field_max;
+    values[PARAM_OMEGA_WHEEL_MAX] = p.omega_motor_max;
+}
+
+static void arrayToParams(const double* values, MPC::Params& p) {
+    p.a = values[PARAM_MOTOR_A];
+    p.b = values[PARAM_MOTOR_B];
+    p.p_x = values[PARAM_P_X];
+    p.p_y = values[PARAM_P_Y];
+    p.p_theta = values[PARAM_P_THETA];
+    p.q_u = values[PARAM_Q_U];
+    p.q_zero_multiplier = values[PARAM_Q_ZERO_MULT];
+    p.q_final_multiplier = values[PARAM_Q_FINAL_MULT];
+    p.p_final_multiplier = values[PARAM_P_FINAL_MULT];
+    p.V_max = values[PARAM_V_MAX];
+    p.delta_u_max = values[PARAM_DELTA_U_MAX];
+    p.delta_u_min = values[PARAM_DELTA_U_MIN];
+    p.x_field_max = values[PARAM_X_FIELD_MAX];
+    p.y_field_max = values[PARAM_Y_FIELD_MAX];
+    p.omega_motor_max = values[PARAM_OMEGA_WHEEL_MAX];
+}
+
+// Writes robot-core's MPC parameters from constants.h (PARAM_COUNT values, ParamIndex order).
+// Returns the number written, or -1 if capacity is too small.
+BRIDGE_API int mpc_bridge_default_params(double* values, int capacity) {
+    if (capacity < PARAM_COUNT) {
+        return BRIDGE_ERROR;
+    }
+    paramsToArray(MPC::Params(), values);
+    return PARAM_COUNT;
+}
+
+// The horizons MPC was compiled with (steps). They size its matrices, so can't be overridden.
+BRIDGE_API void mpc_bridge_horizons(int* control, int* prediction) {
+    *control = CONTROL_HORIZON;
+    *prediction = PREDICTION_HORIZON;
+}
 
 // Loads every path in a JerryIO file. Returns null if the file has no paths.
 BRIDGE_API Bridge* mpc_bridge_create(const char* pathFile) {
@@ -106,7 +216,9 @@ static double referenceCapAt(const ALS_Path& path, double sq, double sEnd, doubl
     InterpSample b = path.sampleAtArcLength(std::min(sq + 3.0, sEnd));
     double ds = std::max(1e-3, b.s - a.s);
     double kappa = std::abs(utils::wrapAngle(b.theta - a.theta)) / ds;
-    return vStraightMax / (1.0 + kappa * TRACK_WIDTH / 2.0);
+    double outerWheelCap = vStraightMax / (1.0 + kappa * TRACK_WIDTH / 2.0);
+    double lateralCap = std::sqrt(MPC_A_LAT_MAX / std::max(kappa, 1e-6));
+    return std::min(outerWheelCap, lateralCap);
 }
 
 // Braking-aware cap. Copy of brakingCapAt in mpcReference.cpp: keep in sync.
@@ -138,7 +250,8 @@ BRIDGE_API int mpc_bridge_reference_speeds(const Bridge* bridge, int index, doub
     const double sEnd = samples.back().s;
     const double h = MPC_SAMPLE_PERIOD;
     const double r = DRIVE_WHEEL_DIAMETER_INCHES / 2.0;
-    const double vStraightMax = 0.9 * (MPC_MOTOR_B / MPC_MOTOR_A) * 12.0 * r;
+    // MPC builds its reference from its own motor model, so use the bridge's (maybe overridden)
+    const double vStraightMax = 0.9 * (bridge->params.b / bridge->params.a) * 12.0 * r;
 
     // (arc length, speed from there) at each reference step
     std::vector<std::pair<double, double>> profile;
@@ -181,6 +294,51 @@ BRIDGE_API int mpc_bridge_closest_point(const Bridge* bridge, double* x, double*
     return 0;
 }
 
+// Replaces the MPC's parameters with values (PARAM_COUNT of them, ParamIndex order), building a
+// fresh MPC. Call before mpc_bridge_set_path. Returns 0, or -1 for a wrong count.
+BRIDGE_API int mpc_bridge_set_params(Bridge* bridge, const double* values, int count) {
+    if (count != PARAM_COUNT) {
+        return BRIDGE_ERROR;
+    }
+    arrayToParams(values, bridge->params);
+    bridge->mpc = std::make_unique<MPC>(bridge->params);
+    bridge->solved = false;
+    return 0;
+}
+
+// The last solve's constraints, one row each of G*U <= b in MPCController::assembleConstraints
+// order: lhs = (G*U)_i for the solved voltages U, rhs = b_i, dual = OSQP's multiplier (positive
+// while the row holds the solution back). Also writes U itself (stage by stage, left then right)
+// when inputs isn't null. Returns the row count, or -1 if the last step didn't solve or a
+// capacity is too small.
+BRIDGE_API int mpc_bridge_constraints(const Bridge* bridge, double* lhs, double* rhs, double* dual,
+                                      int capacity, double* inputs, int inputCapacity) {
+    const MPC& mpc = *bridge->mpc;
+    const OSQPSolver* solver = mpc.*privateMember(SolverTag{});
+    if (!bridge->solved || !solver || capacity < CONSTRAINT_ROWS ||
+        (inputs && inputCapacity < INPUT_COUNT)) {
+        return BRIDGE_ERROR;
+    }
+    const auto& G = mpc.*privateMember(ConstraintMatrixTag{});
+    const auto& b = mpc.*privateMember(ConstraintBoundTag{});
+    Eigen::Matrix<double, INPUT_COUNT, 1> U;
+    for (int i = 0; i < INPUT_COUNT; i++) {
+        U(i) = solver->solution->x[i];
+    }
+    const Eigen::Matrix<double, CONSTRAINT_ROWS, 1> GU = G * U;
+    for (int i = 0; i < CONSTRAINT_ROWS; i++) {
+        lhs[i] = GU(i);
+        rhs[i] = b(i);
+        dual[i] = solver->solution->y[i];
+    }
+    if (inputs) {
+        for (int i = 0; i < INPUT_COUNT; i++) {
+            inputs[i] = U(i);
+        }
+    }
+    return CONSTRAINT_ROWS;
+}
+
 // Starts following a path (PathFollower::setPath). Returns 0, or -1 for a bad index.
 BRIDGE_API int mpc_bridge_set_path(Bridge* bridge, int index) {
     if (index < 0 || index >= static_cast<int>(bridge->paths.size())) {
@@ -190,7 +348,8 @@ BRIDGE_API int mpc_bridge_set_path(Bridge* bridge, int index) {
     bridge->flag = bridge->flags[index];
     bridge->currentSampleIdx = 0;
     bridge->finished = false;
-    bridge->mpc.reset();
+    bridge->solved = false;
+    bridge->mpc->reset();
     return 0;
 }
 
@@ -209,6 +368,7 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
     *vRight = 0.0;
     *distanceLeft = 0.0;
     *offPath = 0.0;
+    bridge->solved = false;
     if (!bridge->path) {
         return BRIDGE_ERROR;
     }
@@ -220,7 +380,7 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
 
     DriveState drive{omegaLeft, omegaRight, batteryVolts, age};
     Pose currentPose{x, y, theta};
-    bridge->mpc.predict(currentPose, drive);
+    bridge->mpc->predict(currentPose, drive);
 
     // only search a short way ahead
     const std::vector<Sample>& samples = path.getSamples();
@@ -246,7 +406,7 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
     }
 
     // compute returns mV in voltage mode, and 0 V after a failed solve
-    WheelVelocities out = bridge->mpc.compute(currentPose, drive, path, bridge->currentSampleIdx, bridge->flag);
+    WheelVelocities out = bridge->mpc->compute(currentPose, drive, path, bridge->currentSampleIdx, bridge->flag);
     if (out.input != ControlMode::INPUT_VOLTAGE) {
         std::fprintf(stderr, "[MPC bridge] controller returned velocities, expected voltages\n");
         return BRIDGE_ERROR;
@@ -257,5 +417,6 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
     if (out.left == 0.0 && out.right == 0.0) {
         return BRIDGE_SOLVE_FAILED;
     }
+    bridge->solved = true;
     return BRIDGE_RUNNING;
 }
