@@ -40,6 +40,20 @@ compile-time (the MPC's horizons) or not simulated.
 The window also checks that the built bridge matches `constants.h`, and says
 to run `scripts\build_native.bat` if it doesn't.
 
+## Trials
+
+The **Trial** section runs autonomous once, with the current overrides, and
+shows how it went: finished, timed out, tipped, cancelled or failed, with
+each path's time and error and the values it ran with.
+
+It needs the drive controller loaded (run `scripts/Motion/drive_controller.py`
+in the Script Editor) and the simulation playing. The controller registers
+itself in `scripts/Motion/controller_registry.py`; the window starts runs
+through `DriveController.run_trial(on_done, overrides, path_file, timeout)`,
+which the optimizer will use too. `on_done` gets an
+`autonomous.TrialResult`, always on a later app update, never inside a
+physics step.
+
 ## Layout
 
 ```

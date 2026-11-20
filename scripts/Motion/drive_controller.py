@@ -74,6 +74,8 @@ if _motion_dir not in sys.path:
 importlib.invalidate_caches()
 
 import autonomous  # noqa: E402
+# Not reloaded below: it holds the registered controller across runs.
+import controller_registry  # noqa: E402
 import drivetrain_config as config  # noqa: E402
 import drivetrain_model as model  # noqa: E402
 import mpc_bridge  # noqa: E402
@@ -228,6 +230,9 @@ class DriveController:
         self.rate_checked = False
         self.autonomous = None
         self.pending_autonomous = None
+        # The trial being run (run_trial): its on_done callback, or None
+        # when autonomous was started with P.
+        self.trial_callback = None
         # Isaac Sim's debug draw interface: None until first used, False if
         # it couldn't be loaded.
         self.debug_draw = None
@@ -293,6 +298,9 @@ class DriveController:
             f"{config.STEPS_PER_CONTROL_PERIOD} per "
             f"{config.CONTROL_PERIOD * 1000:.0f} ms control period"
         )
+
+        # Let the tuning window find this controller and start trials.
+        controller_registry.register(self)
 
     def update_voltages(self):
         key = carb.input.KeyboardInput
@@ -367,7 +375,7 @@ class DriveController:
             # Tipped over: the wheels aren't on the ground.
             tipped = rotation[2][2] < math.cos(config.MAX_WHEEL_TILT)
             if tipped and i == 0 and self.autonomous is not None:
-                self.cancel_autonomous("the robot tipped over")
+                self.cancel_autonomous("the robot tipped over", "tipped")
             if tipped:
                 if print_status:
                     self.print_status(
@@ -407,20 +415,26 @@ class DriveController:
             forces=forces, torques=torques, local_frame=True
         )
 
-    def prepare_autonomous(self):
-        """Load the path file and draw its paths (P key).
+    def prepare_autonomous(self, path_file=None, overrides=None,
+                           timeout=None):
+        """Load the path file and draw its paths (P key, or run_trial).
 
-        Runs from the keyboard handler, outside the physics step, so the
+        Runs outside the physics step (keyboard handler or UI), so the
         drawing doesn't change the stage mid-step. The next physics step
-        places the robot and starts driving.
+        places the robot and starts driving. Returns the error message if
+        it couldn't start, else None.
         """
-        self.cancel_autonomous()
-        self.discard_pending_autonomous()
+        self.cancel_autonomous("restarted")
+        self.discard_pending_autonomous("restarted")
+        path_file = path_file or config.MPC_PATH_FILE
         try:
-            run = autonomous.Autonomous(config.MPC_PATH_FILE, log=self.output)
+            run = autonomous.Autonomous(
+                path_file, log=self.output, overrides=overrides,
+                timeout=timeout,
+            )
         except Exception as error:
             carb.log_error(f"Autonomous not started: {error}")
-            return
+            return str(error)
 
         if config.SHOW_MPC_PATHS:
             try:
@@ -429,6 +443,65 @@ class DriveController:
                 carb.log_warn(f"Couldn't draw the path: {error}")
 
         self.pending_autonomous = run
+        return None
+
+    def run_trial(self, on_done, overrides=None, path_file=None,
+                  timeout=None):
+        """Run autonomous once and report how it went (for the tuning
+        window).
+
+        overrides: bridge parameters (by mpc_bridge.PARAM_NAMES) applied on
+        top of tunable_constants.runtime_overrides(), i.e. on top of
+        MPC_TUNING and the window's overrides. path_file and timeout
+        default to config.MPC_PATH_FILE and config.MPC_PATH_TIMEOUT.
+
+        on_done(autonomous.TrialResult) is called once, on a later app
+        update (never inside a physics step), when the run finishes, times
+        out, tips over, is cancelled or fails to start. Call from outside a
+        physics step. Returns False, without calling on_done, if the
+        simulation isn't playing.
+        """
+        if not self.timeline.is_playing():
+            return False
+        params = tunable_constants.runtime_overrides()
+        params.update(overrides or {})
+        # Cancel any run first, so its callback isn't confused with ours.
+        self.cancel_autonomous("replaced by a new trial")
+        self.discard_pending_autonomous("replaced by a new trial")
+        error = self.prepare_autonomous(path_file, params, timeout)
+        if error is not None:
+            self.deliver_trial(on_done, autonomous.TrialResult(
+                "error", path_file or config.MPC_PATH_FILE, reason=error
+            ))
+            return True
+        self.trial_callback = on_done
+        return True
+
+    def end_trial(self, run, status=None, reason=""):
+        """Report the current trial, if any, as ended. status defaults to
+        the run's outcome.
+        """
+        callback, self.trial_callback = self.trial_callback, None
+        if callback is None:
+            return
+        result = autonomous.TrialResult(
+            status or run.outcome or "cancelled", run.path_file,
+            params=run.params, results=run.results, reason=reason,
+        )
+        self.output(result.summary())
+        self.deliver_trial(callback, result)
+
+    def deliver_trial(self, callback, result):
+        """Call callback(result) on the next app update, outside physics."""
+
+        async def deliver():
+            await omni.kit.app.get_app().next_update_async()
+            try:
+                callback(result)
+            except Exception as error:
+                carb.log_error(f"Trial callback failed: {error}")
+
+        asyncio.ensure_future(deliver())
 
     def draw_paths(self, bridge):
         """Draw the bridge's paths, coloured per config.PATH_DISPLAY_SPEED."""
@@ -459,10 +532,12 @@ class DriveController:
                 f"{v_max:.1f} (green)"
             )
 
-    def discard_pending_autonomous(self):
+    def discard_pending_autonomous(self, reason="cancelled"):
+        """Drop a run that hasn't started driving yet."""
         if self.pending_autonomous is not None:
-            self.pending_autonomous.close()
-            self.pending_autonomous = None
+            run, self.pending_autonomous = self.pending_autonomous, None
+            run.close()
+            self.end_trial(run, "cancelled", reason)
 
     def start_autonomous(self, run, current_position):
         """Move the first robot to the run's start pose and start it."""
@@ -487,7 +562,7 @@ class DriveController:
 
         self.output(
             f"Autonomous: {self.autonomous.bridge.path_count} paths from "
-            f"{config.MPC_PATH_FILE}"
+            f"{self.autonomous.path_file}"
         )
         self.output(
             f"Robot placed at ({x:.1f}, {y:.1f}) in, heading "
@@ -515,9 +590,10 @@ class DriveController:
         if config.SHOW_CLOSEST_POINT:
             self.draw_closest_point()
         if self.autonomous.done and v_left == 0.0 and v_right == 0.0:
-            self.autonomous.close()
-            self.autonomous = None
+            run, self.autonomous = self.autonomous, None
+            run.close()
             self.clear_debug_points()
+            self.end_trial(run)
 
     def draw_closest_point(self):
         """Mark the path point the follower has matched the robot to."""
@@ -557,16 +633,19 @@ class DriveController:
         if draw is not None:
             draw.clear_points()
 
-    def cancel_autonomous(self, reason=None):
-        """Stop autonomous, if running, and brake."""
+    def cancel_autonomous(self, reason=None, status="cancelled"):
+        """Stop autonomous, if running, and brake. A trial in progress
+        ends with status.
+        """
         if self.autonomous is None:
             return
-        self.autonomous.close()
-        self.autonomous = None
+        run, self.autonomous = self.autonomous, None
+        run.close()
         self.clear_debug_points()
         self.set_voltages(0.0, 0.0, brake=True)
         if reason:
             self.output(f"Autonomous stopped: {reason}.")
+        self.end_trial(run, status, reason or "")
 
     def output(self, line):
         """Write a position or path line to config.OUTPUT_FILE."""
@@ -664,7 +743,7 @@ class DriveController:
             int(omni.timeline.TimelineEventType.STOP),
             int(omni.timeline.TimelineEventType.PAUSE),
         ):
-            self.discard_pending_autonomous()
+            self.discard_pending_autonomous("the simulation stopped")
             self.cancel_autonomous("the simulation stopped")
             self.clear_input()
 
@@ -675,8 +754,9 @@ class DriveController:
         )
 
     def shutdown(self):
-        self.discard_pending_autonomous()
-        self.cancel_autonomous()
+        controller_registry.unregister(self)
+        self.discard_pending_autonomous("the controller was reloaded")
+        self.cancel_autonomous("the controller was reloaded")
         self.clear_debug_points()
         self.clear_input()
 

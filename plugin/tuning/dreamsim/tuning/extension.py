@@ -47,17 +47,30 @@ CONSTANTS_HEADER = ROBOT_CORE / "shared" / "include" / "config" / "constants.h"
 OVERRIDES_FILE = REPO_ROOT / "tuning_overrides.json"
 
 
+def _add_motion_path():
+    if str(MOTION_DIR) not in sys.path:
+        sys.path.insert(0, str(MOTION_DIR))
+    importlib.invalidate_caches()
+
+
 def _motion_modules():
     """tunable_constants and mpc_bridge from scripts/Motion, freshly
     reloaded so edits there apply.
     """
-    if str(MOTION_DIR) not in sys.path:
-        sys.path.insert(0, str(MOTION_DIR))
-    importlib.invalidate_caches()
+    _add_motion_path()
     import mpc_bridge
     import tunable_constants
 
     return importlib.reload(tunable_constants), importlib.reload(mpc_bridge)
+
+
+def _controller():
+    """The drive controller loaded in the Script Editor, or None."""
+    _add_motion_path()
+    # Never reloaded: it holds the registration.
+    import controller_registry
+
+    return controller_registry.get()
 
 
 class TuningExtension(omni.ext.IExt):
@@ -67,6 +80,8 @@ class TuningExtension(omni.ext.IExt):
         self._ext_id = ext_id
         self._window = None
         self._overrides = {}
+        self._trial_running = False
+        self._last_trial = None
         # A weak proxy so the menu doesn't keep the extension alive after
         # it's disabled or hot-reloaded.
         proxy = weakref.proxy(self)
@@ -130,6 +145,8 @@ class TuningExtension(omni.ext.IExt):
                                 missing="none yet (created by the first "
                                         "override)",
                             )
+                    with ui.CollapsableFrame("Trial", height=0):
+                        self._build_trial()
                     with ui.HStack(height=24, spacing=6):
                         ui.Label("constants.h", style={"font_size": 16})
                         ui.Button(
@@ -148,6 +165,119 @@ class TuningExtension(omni.ext.IExt):
                     self._constants_frame = ui.Frame(
                         height=0, build_fn=self._build_constants
                     )
+
+    def _build_trial(self):
+        """Run one autonomous run with the current overrides and show how
+        it went.
+        """
+        self._trial_path = ui.SimpleStringModel("")
+        self._trial_timeout = ui.SimpleFloatModel(0.0)
+        with ui.VStack(spacing=4, height=0):
+            self._controller_label = ui.Label("", word_wrap=True)
+            with ui.HStack(height=20, spacing=6):
+                ui.Label("Path file", width=90)
+                ui.StringField(
+                    model=self._trial_path,
+                    tooltip="JerryIO file to run; blank uses "
+                            "drivetrain_config.MPC_PATH_FILE",
+                )
+            with ui.HStack(height=20, spacing=6):
+                ui.Label("Timeout (s)", width=90)
+                ui.FloatField(
+                    model=self._trial_timeout, width=80, precision=1,
+                    tooltip="Per path; 0 uses "
+                            "drivetrain_config.MPC_PATH_TIMEOUT",
+                )
+            with ui.HStack(height=24, spacing=6):
+                ui.Button(
+                    "Run trial", width=100, clicked_fn=self._run_trial,
+                    tooltip="Run autonomous once with the overrides below",
+                )
+                ui.Button(
+                    "Stop", width=80, clicked_fn=self._stop_trial,
+                    tooltip="Stop the running trial",
+                )
+                ui.Button(
+                    "Check", width=80,
+                    clicked_fn=self._update_controller_label,
+                    tooltip="Look for the drive controller again",
+                )
+            self._trial_label = ui.Label(
+                "No trial run yet.", word_wrap=True, style={"color": MUTED},
+            )
+        self._update_controller_label()
+
+    def _update_controller_label(self):
+        controller = _controller()
+        if controller is None:
+            self._controller_label.text = (
+                "Drive controller not loaded: run "
+                "scripts/Motion/drive_controller.py in the Script Editor."
+            )
+            self._controller_label.style = {"color": ERROR}
+            return controller
+        robots = len(controller.prims)
+        self._controller_label.text = (
+            f"Drive controller loaded ({robots} robot"
+            f"{'' if robots == 1 else 's'})."
+        )
+        self._controller_label.style = {"color": GOOD}
+        return controller
+
+    def _run_trial(self):
+        controller = self._update_controller_label()
+        if controller is None:
+            return
+        path = self._trial_path.as_string.strip() or None
+        if path is not None and not Path(path).is_absolute():
+            path = str(REPO_ROOT / path)
+        timeout = self._trial_timeout.as_float or None
+        proxy = weakref.proxy(self)
+        started = controller.run_trial(
+            lambda result: proxy._trial_done(result),
+            path_file=path, timeout=timeout,
+        )
+        if not started:
+            self._show_trial("Press Play first: the simulation isn't "
+                             "running.", ERROR)
+            return
+        self._trial_running = True
+        self._show_trial("Running...", MUTED)
+
+    def _stop_trial(self):
+        controller = _controller()
+        if controller is not None and self._trial_running:
+            controller.discard_pending_autonomous(
+                "stopped from the tuning window"
+            )
+            controller.cancel_autonomous("stopped from the tuning window")
+
+    def _trial_done(self, result):
+        self._trial_running = False
+        self._last_trial = result
+        lines = [result.summary()]
+        for path in result.results:
+            lines.append("  " + path.summary())
+        try:
+            defaults = _motion_modules()[1].default_params()
+            changed = [
+                f"{name} {defaults[name]:g} -> {value:g}"
+                for name, value in result.params.items()
+                if abs(value - defaults[name]) > 1e-12
+            ]
+        except Exception:  # noqa: BLE001 - informational only
+            changed = []
+        lines.append(
+            "Ran with: " + (", ".join(changed) if changed
+                            else "robot-core's values")
+        )
+        self._show_trial(
+            "\n".join(lines), GOOD if result.finished else ERROR
+        )
+
+    def _show_trial(self, text, color):
+        self._trial_label.text = text
+        self._trial_label.style = {"color": color}
 
     def _rebuild(self):
         self._constants_frame.rebuild()

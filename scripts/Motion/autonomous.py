@@ -41,14 +41,66 @@ class PathResult:
         )
 
 
-class Autonomous:
-    """Follows every path in a JerryIO file in order."""
+FINISHED = "finished"
+TIMED_OUT = "timed out"
+BRIDGE_ERROR = "bridge error"
 
-    def __init__(self, path_file, log=print, overrides=None):
+
+class TrialResult:
+    """How one trial (an autonomous run started by run_trial) ended.
+
+    status is FINISHED, TIMED_OUT or BRIDGE_ERROR from the run, or
+    "tipped", "cancelled" or "error" when it was stopped from outside;
+    reason says why for the last three. params are the bridge values it ran
+    with (robot-core's plus overrides), results its PathResults.
+    """
+
+    def __init__(self, status, path_file, params=None, results=(),
+                 reason=""):
+        self.status = status
+        self.reason = reason
+        self.path_file = path_file
+        self.params = dict(params or {})
+        self.results = list(results)
+
+    @property
+    def finished(self):
+        return self.status == FINISHED
+
+    @property
+    def time(self):
+        return sum(result.time for result in self.results)
+
+    def summary(self):
+        text = f"Trial {self.status}"
+        if self.reason:
+            text += f" ({self.reason})"
+        if self.results:
+            worst = max(result.worst_off_path for result in self.results)
+            text += (
+                f" in {self.time:.2f} s: worst {worst:.2f} in off the path, "
+                f"{self.results[-1].final_off_path:.2f} in off at the end"
+            )
+        return text
+
+
+class Autonomous:
+    """Follows every path in a JerryIO file in order.
+
+    Once done, outcome is FINISHED, TIMED_OUT or BRIDGE_ERROR.
+    """
+
+    def __init__(self, path_file, log=print, overrides=None, timeout=None):
         """overrides: MPC parameters instead of robot-core's (a dict by
-        mpc_bridge.PARAM_NAMES); None uses config.MPC_TUNING.
+        mpc_bridge.PARAM_NAMES); None uses
+        tunable_constants.runtime_overrides(). timeout: seconds per path
+        before giving up; None uses config.MPC_PATH_TIMEOUT.
         """
         self.log = log
+        self.path_file = path_file
+        self.timeout = (
+            config.MPC_PATH_TIMEOUT if timeout is None else timeout
+        )
         if overrides is None:
             overrides = tunable_constants.runtime_overrides()
         self.bridge = mpc_bridge.MpcBridge(path_file, overrides)
@@ -60,8 +112,10 @@ class Autonomous:
             )
             self.log(f"MPC tuning (sim only): {changes}")
         self.constraint_log = mpc_constraints.open_log(self.bridge)
+        self.params = self.bridge.params
         self.results = []
         self.done = False
+        self.outcome = None
         self._step = 0
         # (physics step to apply at, v_left, v_right, brake)
         self._pending = []
@@ -90,11 +144,12 @@ class Autonomous:
 
         if not self.done:
             self.results[-1].steps += 1
-            limit = config.MPC_PATH_TIMEOUT * config.PHYSICS_STEPS_PER_SECOND
+            limit = self.timeout * config.PHYSICS_STEPS_PER_SECOND
             if self.results[-1].steps > limit:
                 self._log_result(self.results[-1])
                 self.log("Autonomous stopped: path timed out.")
                 self.done = True
+                self.outcome = TIMED_OUT
                 self._send(0.0, 0.0, brake=True)
         self._step += 1
         return self._applied
@@ -134,12 +189,14 @@ class Autonomous:
                     self._start_path(result.index + 1)
                     continue
                 self.done = True
+                self.outcome = FINISHED
                 self.log("Autonomous complete.")
                 return
 
             if status == mpc_bridge.ERROR:
                 self.log("Autonomous stopped: MPC bridge error.")
                 self.done = True
+                self.outcome = BRIDGE_ERROR
                 self._send(0.0, 0.0, brake=True)
                 return
 
