@@ -441,3 +441,6 @@ output_latest.txt
 # MPC constraint logs (scripts/Motion/mpc_constraints.py), overwritten each run
 mpc_constraints_latest.csv
 mpc_constraint_rows_latest.csv
+
+# Tuning window overrides of constants.h (plugin/tuning)
+tuning_overrides.json

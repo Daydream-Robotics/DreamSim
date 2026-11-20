@@ -295,8 +295,11 @@ MPC_BATTERY_VOLTS = 12.0
 MPC_PATH_TIMEOUT = 30.0
 
 # MPC tuning, sim only: parameters to use instead of robot-core's
-# constants.h, without rebuilding. Empty runs robot-core's values. Keys are
-# the constants' names in lower case without MPC_ (q_u is MPC_Q_U):
+# constants.h, without rebuilding. Empty runs robot-core's values. The
+# tuning window (plugin/tuning) keeps its own overrides in
+# TUNING_OVERRIDES_FILE, applied on top of these. Keys are the constants'
+# names in lower case without MPC_ (q_u is MPC_Q_U; full list in
+# mpc_bridge.PARAM_NAMES):
 #   motor_a, motor_b     the MPC's motor model (1/s, rad/s^2 per V)
 #   p_x, p_y, p_theta    weight on position and heading error; raise p_y
 #                        if it drifts off straight lines, p_theta if it
@@ -310,12 +313,22 @@ MPC_PATH_TIMEOUT = 30.0
 #   q_final_mult         extra penalty on the last change
 #   delta_u_max          largest voltage rise per 20 ms step (V)
 #   delta_u_min          largest voltage drop per step (V, negative)
+#   a_max                reference accel/decel limit (in/s^2)
+#   a_lat_max            reference sideways accel limit in corners
+#   v_ref_min            reference speed floor (in/s)
+#   path_search_ahead    how far ahead the closest-point search looks (in)
+#   end_tolerance        distance from the end that finishes a path (in)
 #   v_max, x_field_max, y_field_max, omega_wheel_max   limits
-# robot-core's docs/MPC_DOCS.md has its tuning notes. The horizons and the
-# reference's acceleration limit are compiled in and can't change here.
-# Copy values that work into constants.h for the real robot.
+# robot-core's docs/MPC_DOCS.md has its tuning notes. The horizons are
+# compiled in and can't change here. Copy values that work into constants.h
+# for the real robot.
 # Example: MPC_TUNING = {"q_u": 0.5, "delta_u_max": 4.0, "delta_u_min": -4.0}
 MPC_TUNING = {}
+
+# The tuning window's overrides of constants.h, by constant name:
+# {"MPC_Q_U": {"value": 0.5, "enabled": true}}. Read at the start of every
+# autonomous run. Gitignored.
+TUNING_OVERRIDES_FILE = REPO_ROOT / "tuning_overrides.json"
 
 # Debug: log which MPC constraints each solve presses against, one CSV line
 # per control step: the first move's limits per side (V+/V- voltage,

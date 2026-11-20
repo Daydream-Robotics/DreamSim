@@ -79,6 +79,7 @@ import drivetrain_model as model  # noqa: E402
 import mpc_bridge  # noqa: E402
 import mpc_constraints  # noqa: E402
 import path_display  # noqa: E402
+import tunable_constants  # noqa: E402
 
 # Reload so edits to these files or robot-core apply without a restart.
 # Config first: the others read it when they load. autonomous after the
@@ -86,6 +87,7 @@ import path_display  # noqa: E402
 config = importlib.reload(config)
 mpc_bridge = importlib.reload(mpc_bridge)
 mpc_constraints = importlib.reload(mpc_constraints)
+tunable_constants = importlib.reload(tunable_constants)
 model = importlib.reload(model)
 autonomous = importlib.reload(autonomous)
 path_display = importlib.reload(path_display)
@@ -270,7 +272,9 @@ class DriveController:
             config.MAX_VOLTAGE * config.MOTOR_KV * config.DRIVE_GEAR_RATIO
         )
         try:
-            params = mpc_bridge.effective_params(config.MPC_TUNING)
+            params = mpc_bridge.effective_params(
+                tunable_constants.runtime_overrides()
+            )
             motor_a, motor_b = params["motor_a"], params["motor_b"]
         except (RuntimeError, ValueError, OSError, AttributeError) as error:
             print(f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "

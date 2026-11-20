@@ -13,6 +13,7 @@ pi/2 along +x (clockwise).
 import drivetrain_config as config
 import mpc_bridge
 import mpc_constraints
+import tunable_constants
 
 
 class PathResult:
@@ -49,7 +50,7 @@ class Autonomous:
         """
         self.log = log
         if overrides is None:
-            overrides = config.MPC_TUNING
+            overrides = tunable_constants.runtime_overrides()
         self.bridge = mpc_bridge.MpcBridge(path_file, overrides)
         if overrides:
             defaults = mpc_bridge.default_params()

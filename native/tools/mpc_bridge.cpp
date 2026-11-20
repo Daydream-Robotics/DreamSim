@@ -40,8 +40,10 @@ enum BridgeStatus {
     BRIDGE_ERROR = -1,
 };
 
-// The MPC parameters Python can override, in the order mpc_bridge_default_params and
-// mpc_bridge_set_params use. Keep in sync with PARAM_NAMES in scripts/Motion/mpc_bridge.py.
+// The values Python can override, in the order mpc_bridge_default_params and
+// mpc_bridge_set_params use: the MPC's parameters, its reference's limits, and the follower
+// loop's search and finish distances. Keep in sync with PARAM_NAMES in
+// scripts/Motion/mpc_bridge.py.
 enum ParamIndex {
     PARAM_MOTOR_A,
     PARAM_MOTOR_B,
@@ -58,6 +60,11 @@ enum ParamIndex {
     PARAM_X_FIELD_MAX,
     PARAM_Y_FIELD_MAX,
     PARAM_OMEGA_WHEEL_MAX,
+    PARAM_A_MAX,
+    PARAM_A_LAT_MAX,
+    PARAM_V_REF_MIN,
+    PARAM_PATH_SEARCH_AHEAD,
+    PARAM_END_TOLERANCE,
     PARAM_COUNT,
 };
 
@@ -91,13 +98,47 @@ template struct PrivateAccess<SolverTag, &MPC::m_solver>;
 template struct PrivateAccess<ConstraintMatrixTag, &MPC::m_G>;
 template struct PrivateAccess<ConstraintBoundTag, &MPC::m_b>;
 
+// MPC builds its reference with robot-core's a_max, a_lat_max and v_ref_min, privately. The
+// same access writes overridden ones into it.
+using Reference = MPCReference<MPC_PREDICTION_HORIZON>;
+struct ReferenceTag {
+    using type = Reference MPC::*;
+    friend type privateMember(ReferenceTag);
+};
+struct ReferenceParamsTag {
+    using type = Reference::Params Reference::*;
+    friend type privateMember(ReferenceParamsTag);
+};
+template struct PrivateAccess<ReferenceTag, &MPC::m_reference>;
+template struct PrivateAccess<ReferenceParamsTag, &Reference::m_params>;
+
+// Everything the bridge runs with: constants.h's values unless overridden.
+struct Settings {
+    MPC::Params mpc;
+    double aMax = MPC_A_MAX;
+    double aLatMax = MPC_A_LAT_MAX;
+    double vRefMin = MPC_V_REF_MIN;
+    double pathSearchAhead = PATH_SEARCH_AHEAD;
+    double endTolerance = END_TOLERANCE;
+};
+
+// A fresh MPC running settings, reference limits included.
+static std::unique_ptr<MPC> makeMpc(const Settings& settings) {
+    auto mpc = std::make_unique<MPC>(settings.mpc);
+    Reference::Params& reference = ((*mpc).*privateMember(ReferenceTag{})).*privateMember(ReferenceParamsTag{});
+    reference.a_max = settings.aMax;
+    reference.a_lat_max = settings.aLatMax;
+    reference.v_ref_min = settings.vRefMin;
+    return mpc;
+}
+
 struct Bridge {
     std::vector<ALS_Path> paths;
     std::vector<PathFlag> flags;
     Pose startPose{0.0, 0.0, 0.0};
 
-    MPC::Params params;
-    std::unique_ptr<MPC> mpc = std::make_unique<MPC>(params);
+    Settings settings;
+    std::unique_ptr<MPC> mpc = makeMpc(settings);
     const ALS_Path* path = nullptr;
     PathFlag flag = PathFlag::FORWARDS;
     std::size_t currentSampleIdx = 0;
@@ -106,7 +147,8 @@ struct Bridge {
     bool solved = false;
 };
 
-static void paramsToArray(const MPC::Params& p, double* values) {
+static void settingsToArray(const Settings& settings, double* values) {
+    const MPC::Params& p = settings.mpc;
     values[PARAM_MOTOR_A] = p.a;
     values[PARAM_MOTOR_B] = p.b;
     values[PARAM_P_X] = p.p_x;
@@ -122,9 +164,15 @@ static void paramsToArray(const MPC::Params& p, double* values) {
     values[PARAM_X_FIELD_MAX] = p.x_field_max;
     values[PARAM_Y_FIELD_MAX] = p.y_field_max;
     values[PARAM_OMEGA_WHEEL_MAX] = p.omega_motor_max;
+    values[PARAM_A_MAX] = settings.aMax;
+    values[PARAM_A_LAT_MAX] = settings.aLatMax;
+    values[PARAM_V_REF_MIN] = settings.vRefMin;
+    values[PARAM_PATH_SEARCH_AHEAD] = settings.pathSearchAhead;
+    values[PARAM_END_TOLERANCE] = settings.endTolerance;
 }
 
-static void arrayToParams(const double* values, MPC::Params& p) {
+static void arrayToSettings(const double* values, Settings& settings) {
+    MPC::Params& p = settings.mpc;
     p.a = values[PARAM_MOTOR_A];
     p.b = values[PARAM_MOTOR_B];
     p.p_x = values[PARAM_P_X];
@@ -140,15 +188,20 @@ static void arrayToParams(const double* values, MPC::Params& p) {
     p.x_field_max = values[PARAM_X_FIELD_MAX];
     p.y_field_max = values[PARAM_Y_FIELD_MAX];
     p.omega_motor_max = values[PARAM_OMEGA_WHEEL_MAX];
+    settings.aMax = values[PARAM_A_MAX];
+    settings.aLatMax = values[PARAM_A_LAT_MAX];
+    settings.vRefMin = values[PARAM_V_REF_MIN];
+    settings.pathSearchAhead = values[PARAM_PATH_SEARCH_AHEAD];
+    settings.endTolerance = values[PARAM_END_TOLERANCE];
 }
 
-// Writes robot-core's MPC parameters from constants.h (PARAM_COUNT values, ParamIndex order).
+// Writes the values this build has from constants.h (PARAM_COUNT values, ParamIndex order).
 // Returns the number written, or -1 if capacity is too small.
 BRIDGE_API int mpc_bridge_default_params(double* values, int capacity) {
     if (capacity < PARAM_COUNT) {
         return BRIDGE_ERROR;
     }
-    paramsToArray(MPC::Params(), values);
+    settingsToArray(Settings(), values);
     return PARAM_COUNT;
 }
 
@@ -211,30 +264,32 @@ BRIDGE_API int mpc_bridge_samples(const Bridge* bridge, int index, double* x, do
 
 // Curvature speed cap at arc length sq. Copy of capAt in robot-core's
 // jetson-nano/src/motion/control/mpcReference.cpp: keep in sync.
-static double referenceCapAt(const ALS_Path& path, double sq, double sEnd, double vStraightMax) {
+static double referenceCapAt(const ALS_Path& path, double sq, double sEnd, double vStraightMax,
+                             double aLatMax) {
     InterpSample a = path.sampleAtArcLength(sq);
     InterpSample b = path.sampleAtArcLength(std::min(sq + 3.0, sEnd));
     double ds = std::max(1e-3, b.s - a.s);
     double kappa = std::abs(utils::wrapAngle(b.theta - a.theta)) / ds;
     double outerWheelCap = vStraightMax / (1.0 + kappa * TRACK_WIDTH / 2.0);
-    double lateralCap = std::sqrt(MPC_A_LAT_MAX / std::max(kappa, 1e-6));
+    double lateralCap = std::sqrt(aLatMax / std::max(kappa, 1e-6));
     return std::min(outerWheelCap, lateralCap);
 }
 
 // Braking-aware cap. Copy of brakingCapAt in mpcReference.cpp: keep in sync.
-static double referenceBrakingCapAt(const ALS_Path& path, double sq, double vNow, double sEnd, double vStraightMax) {
-    double cap = referenceCapAt(path, sq, sEnd, vStraightMax);
-    double brakeDist = (vNow * vNow) / (2.0 * MPC_A_MAX) + 2.0;
+static double referenceBrakingCapAt(const ALS_Path& path, double sq, double vNow, double sEnd,
+                                    double vStraightMax, double aMax, double aLatMax) {
+    double cap = referenceCapAt(path, sq, sEnd, vStraightMax, aLatMax);
+    double brakeDist = (vNow * vNow) / (2.0 * aMax) + 2.0;
     for (double d = 2.0; d <= brakeDist; d += 2.0) {
         double sAhead = sq + d;
         if (sAhead >= sEnd) {
             break;
         }
-        double c = referenceCapAt(path, sAhead, sEnd, vStraightMax);
-        cap = std::min(cap, std::sqrt(c * c + 2.0 * MPC_A_MAX * d));
+        double c = referenceCapAt(path, sAhead, sEnd, vStraightMax, aLatMax);
+        cap = std::min(cap, std::sqrt(c * c + 2.0 * aMax * d));
     }
     double dEnd = std::max(0.0, sEnd - sq);
-    return std::min(cap, std::sqrt(2.0 * MPC_A_MAX * dEnd));
+    return std::min(cap, std::sqrt(2.0 * aMax * dEnd));
 }
 
 // The speed (in/s) robot-core's MPC reference targets at each of a path's spline samples:
@@ -250,18 +305,20 @@ BRIDGE_API int mpc_bridge_reference_speeds(const Bridge* bridge, int index, doub
     const double sEnd = samples.back().s;
     const double h = MPC_SAMPLE_PERIOD;
     const double r = DRIVE_WHEEL_DIAMETER_INCHES / 2.0;
-    // MPC builds its reference from its own motor model, so use the bridge's (maybe overridden)
-    const double vStraightMax = 0.9 * (bridge->params.b / bridge->params.a) * 12.0 * r;
+    // the bridge's (maybe overridden) settings, as its MPC's reference uses
+    const Settings& settings = bridge->settings;
+    const double vStraightMax = 0.9 * (settings.mpc.b / settings.mpc.a) * 12.0 * r;
+    const double aMax = settings.aMax;
 
     // (arc length, speed from there) at each reference step
     std::vector<std::pair<double, double>> profile;
     double s = 0.0;
-    double v = MPC_V_REF_MIN;
+    double v = settings.vRefMin;
     while (profile.size() < 1000000) {
-        double vFloor = (sEnd - s < 6.0) ? 1.0 : MPC_V_REF_MIN;
-        double vCap = referenceBrakingCapAt(path, s, v, sEnd, vStraightMax);
-        double vTarget = std::min(vCap, v + MPC_A_MAX * h);
-        v = std::max({vTarget, v - MPC_A_MAX * h, vFloor});
+        double vFloor = (sEnd - s < 6.0) ? 1.0 : settings.vRefMin;
+        double vCap = referenceBrakingCapAt(path, s, v, sEnd, vStraightMax, aMax, settings.aLatMax);
+        double vTarget = std::min(vCap, v + aMax * h);
+        v = std::max({vTarget, v - aMax * h, vFloor});
         profile.emplace_back(s, v);
         s += v * h;
         if (s >= sEnd) {
@@ -294,14 +351,14 @@ BRIDGE_API int mpc_bridge_closest_point(const Bridge* bridge, double* x, double*
     return 0;
 }
 
-// Replaces the MPC's parameters with values (PARAM_COUNT of them, ParamIndex order), building a
+// Replaces the bridge's settings with values (PARAM_COUNT of them, ParamIndex order), building a
 // fresh MPC. Call before mpc_bridge_set_path. Returns 0, or -1 for a wrong count.
 BRIDGE_API int mpc_bridge_set_params(Bridge* bridge, const double* values, int count) {
     if (count != PARAM_COUNT) {
         return BRIDGE_ERROR;
     }
-    arrayToParams(values, bridge->params);
-    bridge->mpc = std::make_unique<MPC>(bridge->params);
+    arrayToSettings(values, bridge->settings);
+    bridge->mpc = makeMpc(bridge->settings);
     bridge->solved = false;
     return 0;
 }
@@ -384,7 +441,7 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
 
     // only search a short way ahead
     const std::vector<Sample>& samples = path.getSamples();
-    const double searchLimit = samples[std::min(bridge->currentSampleIdx, samples.size() - 1)].s + PATH_SEARCH_AHEAD;
+    const double searchLimit = samples[std::min(bridge->currentSampleIdx, samples.size() - 1)].s + bridge->settings.pathSearchAhead;
     std::size_t searchEnd = bridge->currentSampleIdx;
     while (searchEnd < samples.size() && samples[searchEnd].s <= searchLimit) {
         searchEnd++;
@@ -400,7 +457,7 @@ BRIDGE_API int mpc_bridge_step(Bridge* bridge, double x, double y, double theta,
     const Sample& closest = samples[bridge->currentSampleIdx];
     *distanceLeft = path.getTotalLength() - closest.s;
     *offPath = std::hypot(x - closest.x, y - closest.y);
-    if (*distanceLeft < END_TOLERANCE) {
+    if (*distanceLeft < bridge->settings.endTolerance) {
         bridge->finished = true;
         return BRIDGE_FINISHED;
     }

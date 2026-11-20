@@ -26,6 +26,20 @@ Open the window from **Window → DreamSim → MPC Tuning**.
 Kit watches the extension's Python files and reloads the extension when they
 change, so edits show up without restarting Isaac Sim.
 
+## Overrides
+
+The window lists every constant in `constants.h` under its `[CATEGORY]`
+banner. Constants the sim applies at runtime (`TUNABLE` in
+`scripts/Motion/tunable_constants.py`) get a toggle and a value: ticking it
+overrides `constants.h` for sim runs from the next autonomous run (P),
+without rebuilding. Overrides are saved to `tuning_overrides.json` in the
+repo root (gitignored) and never change `constants.h`. Other constants show
+why they're locked: physical (shared with the sim's physics or measured),
+compile-time (the MPC's horizons) or not simulated.
+
+The window also checks that the built bridge matches `constants.h`, and says
+to run `scripts\build_native.bat` if it doesn't.
+
 ## Layout
 
 ```

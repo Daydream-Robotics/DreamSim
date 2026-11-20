@@ -21,6 +21,7 @@ from pathlib import Path
 import autonomous
 import drivetrain_config as config
 import drivetrain_model as model
+import tunable_constants
 
 
 def run(path_file, overrides):
@@ -66,7 +67,7 @@ def run(path_file, overrides):
 
 def main():
     args = sys.argv[1:]
-    overrides = dict(config.MPC_TUNING)
+    overrides = tunable_constants.runtime_overrides()
     files = []
     while args:
         arg = args.pop(0)

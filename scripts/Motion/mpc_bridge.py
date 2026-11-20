@@ -28,10 +28,11 @@ ERROR = -1
 _double_p = ctypes.POINTER(ctypes.c_double)
 _int_p = ctypes.POINTER(ctypes.c_int)
 
-# The MPC parameters that can be overridden at runtime, in the bridge's
-# order (ParamIndex in native/tools/mpc_bridge.cpp: keep in sync). Each is
-# robot-core's constant of the same name in upper case with MPC_ in front,
-# e.g. q_u is MPC_Q_U.
+# The values that can be overridden at runtime, in the bridge's order
+# (ParamIndex in native/tools/mpc_bridge.cpp: keep in sync). Each is
+# robot-core's constant of the same name in upper case, with MPC_ in front
+# for all but the last two: q_u is MPC_Q_U, end_tolerance is END_TOLERANCE.
+# tunable_constants.py maps them to constants.h names.
 PARAM_NAMES = (
     "motor_a",
     "motor_b",
@@ -48,6 +49,11 @@ PARAM_NAMES = (
     "x_field_max",
     "y_field_max",
     "omega_wheel_max",
+    "a_max",
+    "a_lat_max",
+    "v_ref_min",
+    "path_search_ahead",
+    "end_tolerance",
 )
 
 
