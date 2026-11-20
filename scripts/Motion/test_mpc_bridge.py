@@ -1,13 +1,17 @@
 """Run robot-core's MPC over a JerryIO file without Isaac Sim.
 
 Drives the same autonomous.py and drivetrain_model.py physics as
-drivetrain_controller.py, on a flat 2D rigid body: no PhysX, collisions, walls or
+drive_controller.py, on a flat 2D rigid body: no PhysX, collisions, walls or
 tipping. A quick check after changing robot-core or the drivetrain model.
 
 usage (from the repo root, after scripts\\build_native.bat):
-    python scripts/Motion/test_mpc_bridge.py [path.jerryio.txt ...]
+    python scripts/Motion/test_mpc_bridge.py [--set name=value ...]
+        [path.jerryio.txt ...]
 
-With no files it runs config.MPC_PATH_FILE.
+With no files it runs config.MPC_PATH_FILE. Each --set overrides an MPC
+parameter on top of config.MPC_TUNING, e.g. --set q_u=0.5 (names in
+mpc_bridge.PARAM_NAMES). The constraint log goes to
+config.MPC_CONSTRAINT_FILE, as in Isaac Sim.
 """
 
 import math
@@ -19,9 +23,11 @@ import drivetrain_config as config
 import drivetrain_model as model
 
 
-def run(path_file):
+def run(path_file, overrides):
     """Drive every path in path_file. Returns the list of PathResults."""
-    run = autonomous.Autonomous(path_file, log=lambda line: print("  " + line))
+    run = autonomous.Autonomous(
+        path_file, log=lambda line: print("  " + line), overrides=overrides
+    )
     x, y, heading = run.start_pose()
 
     # World frame: metres, Isaac Sim yaw (0 along +x, anticlockwise).
@@ -59,7 +65,19 @@ def run(path_file):
 
 
 def main():
-    files = [Path(arg) for arg in sys.argv[1:]] or [config.MPC_PATH_FILE]
+    args = sys.argv[1:]
+    overrides = dict(config.MPC_TUNING)
+    files = []
+    while args:
+        arg = args.pop(0)
+        if arg == "--set":
+            if not args or "=" not in args[0]:
+                sys.exit("--set needs name=value, e.g. --set q_u=0.5")
+            name, value = args.pop(0).split("=", 1)
+            overrides[name.strip()] = float(value)
+        else:
+            files.append(Path(arg))
+    files = files or [config.MPC_PATH_FILE]
     print(
         f"Brake mode {config.DRIVE_BRAKE_MODE}, sideways friction "
         f"{config.WHEEL_SIDEWAYS_FRICTION}, inertia scale "
@@ -68,7 +86,7 @@ def main():
     )
     for path_file in files:
         print(f"{path_file.name}:")
-        results = run(path_file)
+        results = run(path_file, overrides)
         finished = sum(result.finished for result in results)
         failed = sum(result.failed_solves for result in results)
         worst = max(result.worst_off_path for result in results)

@@ -437,3 +437,7 @@ build/
 
 # Drive controller position and path output, overwritten each run
 output_latest.txt
+
+# MPC constraint logs (scripts/Motion/mpc_constraints.py), overwritten each run
+mpc_constraints_latest.csv
+mpc_constraint_rows_latest.csv

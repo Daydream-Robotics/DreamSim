@@ -108,8 +108,8 @@ CONTROL_PERIOD = _robot["MPC_SAMPLE_PERIOD"]  # s
 # predicts the robot forward over it, so the sim applies each command this
 # much later to match.
 COMMAND_DELAY = _robot["MPC_COMMAND_DELAY"]  # s
-MOTOR_A = _robot["MPC_MOTOR_A"]  # 1/s
-MOTOR_B = _robot["MPC_MOTOR_B"]  # rad/s^2 per V, wheel side
+# The MPC's motor model (MPC_MOTOR_A/B) isn't read here: it's compiled into
+# the bridge. mpc_bridge.motor_model() reports the values it uses.
 
 _left_ports = read_define_list(
     LINK_CONSTANTS_HEADER, "LEFT_DRIVE_WHEEL_PORTS"
@@ -126,7 +126,8 @@ CARTRIDGE_RPM = read_cartridge_rpm(BRAIN_SUBSYSTEMS_HEADER, "leftMotors")
 # V5 11W motor model.
 # TODO: confirm. These are community estimates fitted to VEX's published
 # curve (100 rpm cartridge, 12.8 V), not official VEX numbers. Check them
-# against MOTOR_A/MOTOR_B, which come from the real robot.
+# against the MPC's motor model (printed when the controller loads), which
+# comes from the real robot.
 NOMINAL_VOLTAGE = 12.8
 STALL_TORQUE_100RPM = 3.99  # N*m, without the current limit
 STALL_CURRENT = 4.69  # A
@@ -203,7 +204,7 @@ ROBOT_HEIGHT = 12.0 * INCH
 # TODO(real robot): approximation tuned by feel. Get the real value from
 # CAD mass properties, a bifilar pendulum test, or by matching the real
 # robot's spin-up time at +/-12 V.
-ROBOT_INERTIA_SCALE = 0.3
+ROBOT_INERTIA_SCALE = 0.35
 ROBOT_INERTIA = tuple(
     ROBOT_INERTIA_SCALE * ROBOT_MASS * (a**2 + b**2) / 12.0
     for a, b in (
@@ -216,7 +217,7 @@ ROBOT_INERTIA = tuple(
 # Wheels: evenly spaced along each side, the end wheels WHEEL_EDGE_INSET in
 # from the front and back edges. Sides sit at +/-TRACK_WIDTH/2.
 # TODO(real robot): confirm count and positions.
-WHEELS_PER_SIDE = 3
+WHEELS_PER_SIDE = 4
 WHEEL_EDGE_INSET = 1.0 * INCH
 _end_wheel_x = ROBOT_LENGTH / 2.0 - WHEEL_EDGE_INSET
 if WHEELS_PER_SIDE == 1:
@@ -228,9 +229,10 @@ else:
     ]  # m, forward of centre
 
 # All wheels are omni.
-# TODO(real robot): measure rolling with the tile tilt test. It's the only
-# published number (one team's 4" omni on foam tile, direction not stated).
-WHEEL_ROLLING_FRICTION = 0.93
+# Tile tilt test, wheels locked, on the test robot (not the final one):
+# slid at a 370 mm rise on a 595 mm tile, 370 / sqrt(595^2 - 370^2).
+# TODO(real robot): re-measure on the final robot.
+WHEEL_ROLLING_FRICTION = 0.79
 
 # TODO(real robot): approximation tuned by feel. No published value exists
 # for omni wheels sideways. With all-omni wheels this one value trades
@@ -246,11 +248,17 @@ WHEEL_SIDEWAYS_FRICTION = 0.3
 # Rolling resistance and drivetrain drag, as a fraction of each wheel's
 # load. Without it the motors' braking fades as the robot slows, leaving a
 # long slow glide; this brings it to a full stop.
-# TODO(real robot): approximation. Calibrate with a coast-down test: drive
-# at full speed, cut the voltage, and match the stopping distance. The
-# real robot's brake mode matters too: robot-core's path follower sets
-# the drive to coast.
-WHEEL_ROLLING_RESISTANCE = 0.03
+# Fitted to the test robot (not the final one; ~10 kg, 600 rpm at the
+# wheel) with sideways friction 0.3: 0.18 matches its +/-12 V spin in place
+# (600 deg/s; sim 601 deg/s). Its brake stop from full speed doesn't match
+# (10-12 in; sim 18.7 in): matching that needs about 0.30, where the robot
+# can't spin at all. Check the real top speed before blaming this value;
+# the sim's motor braking may be too weak instead. Above about 0.20 the
+# spin collapses. Mostly the unpowered motors' gearboxes being
+# back-driven. The tile tilt test with wheels free gave 0.36 (200 mm rise
+# on a 595 mm tile), but that's breakaway: the drag once rolling is lower.
+# TODO(real robot): re-measure on the final robot.
+WHEEL_ROLLING_RESISTANCE = 0.18
 
 # Fraction of each wheel's sideways slip removed per physics step, below
 # the friction limit. Higher grips harder; near 1 or above jitters.
@@ -277,14 +285,50 @@ STATUS_INTERVAL = 0.05
 # Autonomous (P key in drive_controller.py, and test_mpc_bridge.py): the
 # JerryIO file whose paths robot-core's MPC follows, in order.
 MPC_PATH_FILE = (
-    REPO_ROOT / "paths" / "twin_test_path.txt"
+    REPO_ROOT / "paths" / "loop-d-lewpe.txt"
 )
 # Battery voltage reported to the MPC. The motor model has no sag, so this
 # matches the 12 V it drives with.
 MPC_BATTERY_VOLTS = 12.0
 # Give up on a path that hasn't finished after this long (s). robot-core has
 # no limit, but a robot stuck in the sim would otherwise run forever.
-MPC_PATH_TIMEOUT = 15.0
+MPC_PATH_TIMEOUT = 30.0
+
+# MPC tuning, sim only: parameters to use instead of robot-core's
+# constants.h, without rebuilding. Empty runs robot-core's values. Keys are
+# the constants' names in lower case without MPC_ (q_u is MPC_Q_U):
+#   motor_a, motor_b     the MPC's motor model (1/s, rad/s^2 per V)
+#   p_x, p_y, p_theta    weight on position and heading error; raise p_y
+#                        if it drifts off straight lines, p_theta if it
+#                        cuts corners
+#   p_final_mult         extra weight on the error at the horizon's end
+#   q_u                  penalty on voltage changes; raise it if the
+#                        voltages chatter, lower it if it turns wide or
+#                        leaves small errors uncorrected
+#   q_zero_mult          extra penalty on the first change (from the last
+#                        voltage sent)
+#   q_final_mult         extra penalty on the last change
+#   delta_u_max          largest voltage rise per 20 ms step (V)
+#   delta_u_min          largest voltage drop per step (V, negative)
+#   v_max, x_field_max, y_field_max, omega_wheel_max   limits
+# robot-core's docs/MPC_DOCS.md has its tuning notes. The horizons and the
+# reference's acceleration limit are compiled in and can't change here.
+# Copy values that work into constants.h for the real robot.
+# Example: MPC_TUNING = {"q_u": 0.5, "delta_u_max": 4.0, "delta_u_min": -4.0}
+MPC_TUNING = {}
+
+# Debug: log which MPC constraints each solve presses against, one CSV line
+# per control step: the first move's limits per side (V+/V- voltage,
+# slew+/slew- slew rate, speed wheel speed, field) and how many rows of
+# each limit are active over the horizon. Each path's summary also says how
+# often its first move was held at each limit. Overwritten each run;
+# gitignored.
+MPC_CONSTRAINT_LOG = True
+MPC_CONSTRAINT_FILE = REPO_ROOT / "mpc_constraints_latest.csv"
+# Also write every constraint row of every solve (group, bound, stage, side,
+# G*U, b, slack, dual): about 300 lines per step, for a close look.
+MPC_CONSTRAINT_ROWS = False
+MPC_CONSTRAINT_ROWS_FILE = REPO_ROOT / "mpc_constraint_rows_latest.csv"
 
 # Draw MPC_PATH_FILE's paths on the field when autonomous starts: ribbons
 # coloured by path speed (red slow, green fast), drawn in the stage's

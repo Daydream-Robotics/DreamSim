@@ -69,17 +69,23 @@ def find_motion_dir():
 _motion_dir = str(find_motion_dir())
 if _motion_dir not in sys.path:
     sys.path.insert(0, _motion_dir)
+# Isaac Sim's Python caches each folder's file list, so a module added to
+# scripts/Motion while it runs wouldn't be found without this.
+importlib.invalidate_caches()
 
 import autonomous  # noqa: E402
 import drivetrain_config as config  # noqa: E402
 import drivetrain_model as model  # noqa: E402
 import mpc_bridge  # noqa: E402
+import mpc_constraints  # noqa: E402
 import path_display  # noqa: E402
 
 # Reload so edits to these files or robot-core apply without a restart.
-# Config first: the others read it when they load.
+# Config first: the others read it when they load. autonomous after the
+# modules it uses.
 config = importlib.reload(config)
 mpc_bridge = importlib.reload(mpc_bridge)
+mpc_constraints = importlib.reload(mpc_constraints)
 model = importlib.reload(model)
 autonomous = importlib.reload(autonomous)
 path_display = importlib.reload(path_display)
@@ -259,15 +265,24 @@ class DriveController:
         print(f"Tank controller loaded for: {paths}")
         print(f"Position and path output: {config.OUTPUT_FILE}")
 
-        # Compare the motor model with the robot's identified model.
+        # Compare the sim's motor model with the one the MPC was built with.
         model_speed = (
             config.MAX_VOLTAGE * config.MOTOR_KV * config.DRIVE_GEAR_RATIO
         )
-        robot_speed = config.MAX_VOLTAGE * config.MOTOR_B / config.MOTOR_A
-        print(
-            f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
-            f"{model_speed:.1f} rad/s, robot-core {robot_speed:.1f} rad/s"
-        )
+        try:
+            params = mpc_bridge.effective_params(config.MPC_TUNING)
+            motor_a, motor_b = params["motor_a"], params["motor_b"]
+        except (RuntimeError, ValueError, OSError, AttributeError) as error:
+            print(f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
+                  f"{model_speed:.1f} rad/s (MPC bridge unavailable: "
+                  f"{error})")
+        else:
+            mpc_speed = config.MAX_VOLTAGE * motor_b / motor_a
+            print(
+                f"Wheel top speed at {config.MAX_VOLTAGE:.0f} V: model "
+                f"{model_speed:.1f} rad/s, MPC {mpc_speed:.1f} rad/s "
+                f"(a {motor_a:.2f}, b {motor_b:.2f})"
+            )
         print(f"Config: {config.__file__}")
         print(
             f"Physics: {config.PHYSICS_STEPS_PER_SECOND} steps/s, "
@@ -734,3 +749,4 @@ async def load_tank_controls():
 
 
 _tank_loader_task = asyncio.ensure_future(load_tank_controls())
+
